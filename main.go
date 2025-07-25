@@ -7,6 +7,7 @@ import (
 	"net"
 	"os"
 	"os/signal"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -46,6 +47,71 @@ func bytesPerSecToMbps(bytesPerSec int64) float64 {
 	return float64(bytesPerSec) * 8 / 1024 / 1024
 }
 
+// isIPv6 检查IP地址是否为IPv6
+func isIPv6(ip string) bool {
+	return strings.Contains(ip, ":")
+}
+
+// validateIP 验证IP地址格式
+func validateIP(ip string) error {
+	if ip == "" {
+		return nil // 空IP表示使用默认
+	}
+	
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		return fmt.Errorf("无效的IP地址格式: %s", ip)
+	}
+	
+	return nil
+}
+
+// checkLocalIP 检查IP是否为本地IP地址
+func checkLocalIP(ip string) error {
+	if ip == "" {
+		return nil
+	}
+	
+	// 获取所有网络接口
+	interfaces, err := net.Interfaces()
+	if err != nil {
+		return fmt.Errorf("获取网络接口失败: %v", err)
+	}
+	
+	// 检查IP是否在本地接口上
+	for _, iface := range interfaces {
+		addrs, err := iface.Addrs()
+		if err != nil {
+			continue
+		}
+		
+		for _, addr := range addrs {
+			switch v := addr.(type) {
+			case *net.IPNet:
+				if v.IP.String() == ip {
+					return nil // 找到匹配的本地IP
+				}
+			case *net.IPAddr:
+				if v.IP.String() == ip {
+					return nil // 找到匹配的本地IP
+				}
+			}
+		}
+	}
+	
+	// 如果没找到，可能是因为网络接口状态问题，暂时跳过验证
+	// 在实际连接时会再次验证
+	return nil
+}
+
+// getNetworkProtocol 根据IP地址获取网络协议
+func getNetworkProtocol(ip string) string {
+	if isIPv6(ip) {
+		return "udp6"
+	}
+	return "udp"
+}
+
 // ConnectionInfo 连接信息
 type ConnectionInfo struct {
 	SourceIP   string
@@ -54,6 +120,7 @@ type ConnectionInfo struct {
 	Conn       *net.UDPConn
 	BytesSent  int64
 	StartTime  time.Time
+	Protocol   string // 网络协议 (udp/udp6)
 }
 
 // UDPShooter UDP打流器
@@ -127,6 +194,23 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("目标端口必须大于0")
 	}
 
+	// 验证IP地址格式
+	for i, sourceIP := range config.SourceIPs {
+		if err := validateIP(sourceIP); err != nil {
+			return nil, fmt.Errorf("源IP %d (%s): %v", i+1, sourceIP, err)
+		}
+		// 验证源IP是否为本地IP地址
+		if err := checkLocalIP(sourceIP); err != nil {
+			return nil, fmt.Errorf("源IP %d (%s): %v", i+1, sourceIP, err)
+		}
+	}
+	
+	for i, targetIP := range config.TargetIPs {
+		if err := validateIP(targetIP); err != nil {
+			return nil, fmt.Errorf("目标IP %d (%s): %v", i+1, targetIP, err)
+		}
+	}
+
 	// 转换单位：MB -> bytes, Mbps -> bytes/s
 	config.TotalBytes = mbToBytes(config.TotalBytes)
 	config.Bandwidth = mbpsToBytesPerSec(config.Bandwidth)
@@ -138,48 +222,120 @@ func loadConfig(configPath string) (*Config, error) {
 func (s *UDPShooter) createConnections() error {
 	s.connections = make([]*ConnectionInfo, 0)
 	
-	// 计算每个连接的流量限制
-	totalConnections := len(s.config.SourceIPs) * len(s.config.TargetIPs)
+	// 按IP版本分组源IP和目标IP
+	var sourceIPv4, sourceIPv6, targetIPv4, targetIPv6 []string
+	
+	for _, sourceIP := range s.config.SourceIPs {
+		if isIPv6(sourceIP) {
+			sourceIPv6 = append(sourceIPv6, sourceIP)
+		} else {
+			sourceIPv4 = append(sourceIPv4, sourceIP)
+		}
+	}
+	
+	for _, targetIP := range s.config.TargetIPs {
+		if isIPv6(targetIP) {
+			targetIPv6 = append(targetIPv6, targetIP)
+		} else {
+			targetIPv4 = append(targetIPv4, targetIP)
+		}
+	}
+	
+	// 创建IPv4连接
+	ipv4Connections := len(sourceIPv4) * len(targetIPv4)
+	// 创建IPv6连接
+	ipv6Connections := len(sourceIPv6) * len(targetIPv6)
+	
+	totalConnections := ipv4Connections + ipv6Connections
+	if totalConnections == 0 {
+		return fmt.Errorf("没有找到兼容的IPv4或IPv6连接对")
+	}
+	
 	bytesPerConnection := s.config.TotalBytes / int64(totalConnections)
 	bandwidthPerConnection := s.config.Bandwidth / int64(totalConnections)
 
-	s.logManager.Log("创建 %d 个连接，每个连接流量限制: %.2f MB, 带宽限制: %.2f Mbps", 
-		totalConnections, bytesToMB(bytesPerConnection), bytesPerSecToMbps(bandwidthPerConnection))
+	s.logManager.Log("创建连接 - IPv4: %d个, IPv6: %d个, 总计: %d个", 
+		ipv4Connections, ipv6Connections, totalConnections)
+	s.logManager.Log("每个连接流量限制: %.2f MB, 带宽限制: %.2f Mbps", 
+		bytesToMB(bytesPerConnection), bytesPerSecToMbps(bandwidthPerConnection))
 
-	for _, sourceIP := range s.config.SourceIPs {
-		for _, targetIP := range s.config.TargetIPs {
-			// 创建UDP连接
-			raddr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", targetIP, s.config.TargetPort))
-			if err != nil {
-				return fmt.Errorf("解析目标地址失败 %s:%d: %v", targetIP, s.config.TargetPort, err)
+	// 创建IPv4连接
+	for _, sourceIP := range sourceIPv4 {
+		for _, targetIP := range targetIPv4 {
+			if err := s.createSingleConnection(sourceIP, targetIP, "udp", bytesPerConnection, bandwidthPerConnection); err != nil {
+				return err
 			}
-
-			var laddr *net.UDPAddr
-			if sourceIP != "" {
-				laddr, err = net.ResolveUDPAddr("udp", sourceIP+":0")
-				if err != nil {
-					return fmt.Errorf("解析源地址失败 %s: %v", sourceIP, err)
-				}
+		}
+	}
+	
+	// 创建IPv6连接
+	for _, sourceIP := range sourceIPv6 {
+		for _, targetIP := range targetIPv6 {
+			if err := s.createSingleConnection(sourceIP, targetIP, "udp6", bytesPerConnection, bandwidthPerConnection); err != nil {
+				return err
 			}
-
-			conn, err := net.DialUDP("udp", laddr, raddr)
-			if err != nil {
-				return fmt.Errorf("创建UDP连接失败 %s -> %s:%d: %v", sourceIP, targetIP, s.config.TargetPort, err)
-			}
-
-			connInfo := &ConnectionInfo{
-				SourceIP:   sourceIP,
-				TargetIP:   targetIP,
-				TargetPort: s.config.TargetPort,
-				Conn:       conn,
-				StartTime:  time.Now(),
-			}
-
-			s.connections = append(s.connections, connInfo)
-			s.logManager.Log("创建连接: %s -> %s:%d", sourceIP, targetIP, s.config.TargetPort)
 		}
 	}
 
+	return nil
+}
+
+// createSingleConnection 创建单个连接
+func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string, bytesPerConnection, bandwidthPerConnection int64) error {
+	// 创建UDP连接
+	var raddr *net.UDPAddr
+	var err error
+	
+	if protocol == "udp6" {
+		// IPv6地址需要用方括号包围
+		raddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("[%s]:%d", targetIP, s.config.TargetPort))
+	} else {
+		raddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("%s:%d", targetIP, s.config.TargetPort))
+	}
+	if err != nil {
+		// 如果目标地址解析失败，记录警告但继续尝试
+		s.logManager.Log("警告: 无法解析目标地址 %s:%d: %v", targetIP, s.config.TargetPort, err)
+		return nil
+	}
+
+	var laddr *net.UDPAddr
+	if sourceIP != "" {
+		// 对于源地址绑定，我们需要指定一个端口，让系统自动分配
+		if protocol == "udp6" {
+			// IPv6地址需要用方括号包围
+			laddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("[%s]:0", sourceIP))
+		} else {
+			laddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("%s:0", sourceIP))
+		}
+		if err != nil {
+			// 如果源地址绑定失败，尝试不绑定源地址
+			s.logManager.Log("警告: 无法绑定源地址 %s，将使用系统默认地址: %v", sourceIP, err)
+			laddr = nil
+		}
+	}
+
+	conn, err := net.DialUDP(protocol, laddr, raddr)
+	if err != nil {
+		return fmt.Errorf("创建UDP连接失败 %s -> %s:%d: %v", sourceIP, targetIP, s.config.TargetPort, err)
+	}
+	
+	// 验证连接是否成功建立
+	if conn == nil {
+		return fmt.Errorf("UDP连接创建失败: 连接对象为空")
+	}
+
+	connInfo := &ConnectionInfo{
+		SourceIP:   sourceIP,
+		TargetIP:   targetIP,
+		TargetPort: s.config.TargetPort,
+		Conn:       conn,
+		StartTime:  time.Now(),
+		Protocol:   protocol,
+	}
+
+	s.connections = append(s.connections, connInfo)
+	s.logManager.Log("创建连接: %s -> %s:%d (协议: %s)", sourceIP, targetIP, s.config.TargetPort, protocol)
+	
 	return nil
 }
 
@@ -228,15 +384,15 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 	}
 
 	// 计算该连接的流量限制
-	totalConnections := len(s.config.SourceIPs) * len(s.config.TargetIPs)
+	totalConnections := len(s.connections)
 	bytesPerConnection := s.config.TotalBytes / int64(totalConnections)
 	bandwidthPerConnection := s.config.Bandwidth / int64(totalConnections)
 
 	var bytesSent int64
 	var lastReport = time.Now()
 
-	s.logManager.Log("线程 %d-%d 开始工作: %s -> %s:%d", connIndex, threadID, 
-		connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort)
+	s.logManager.Log("线程 %d-%d 开始工作: %s -> %s:%d (协议: %s)", connIndex, threadID, 
+		connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, connInfo.Protocol)
 
 	for {
 		select {
@@ -251,14 +407,16 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 
 		// 检查总流量限制
 		if bytesPerConnection > 0 && bytesSent >= bytesPerConnection {
-			s.logManager.Log("线程 %d-%d 达到流量限制: %.2f MB", connIndex, threadID, bytesToMB(bytesSent))
+			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 达到流量限制: %.2f MB", 
+				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
 			return
 		}
 
 		// 发送数据包
 		n, err := connInfo.Conn.Write(packet)
 		if err != nil {
-			s.logManager.Log("线程 %d-%d 发送失败: %v", connIndex, threadID, err)
+			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 发送失败: %v", 
+				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err)
 			continue
 		}
 
@@ -282,7 +440,8 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 
 		// 定期报告
 		if time.Since(lastReport) > 10*time.Second {
-			s.logManager.Log("线程 %d-%d 已发送: %.2f MB", connIndex, threadID, bytesToMB(bytesSent))
+			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 已发送: %.2f MB", 
+				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
 			lastReport = time.Now()
 		}
 	}
