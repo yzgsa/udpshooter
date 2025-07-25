@@ -17,13 +17,33 @@ type Config struct {
 	SourceIPs     []string `json:"source_ips"`      // 源IP地址列表
 	TargetIPs     []string `json:"target_ips"`      // 目标IP地址列表
 	TargetPort    int      `json:"target_port"`     // 目标端口
-	Bandwidth     int64    `json:"bandwidth"`       // 总带宽限制 (bytes/s)
-	TotalBytes    int64    `json:"total_bytes"`     // 总流量限制 (bytes)
+	Bandwidth     int64    `json:"bandwidth"`       // 总带宽限制 (Mbps)
+	TotalBytes    int64    `json:"total_bytes"`     // 总流量限制 (MB)
 	ThreadCount   int      `json:"thread_count"`    // 每个连接的线程数量
 	PacketSize    int      `json:"packet_size"`     // 数据包大小
 	ConfigFile    string   `json:"config_file"`     // 配置文件路径
 	ReloadInterval int     `json:"reload_interval"` // 配置重载间隔(秒)
 	LogDir        string   `json:"log_dir"`         // 日志目录
+}
+
+// mbToBytes 将MB转换为字节
+func mbToBytes(mb int64) int64 {
+	return mb * 1024 * 1024
+}
+
+// mbpsToBytesPerSec 将Mbps转换为字节/秒
+func mbpsToBytesPerSec(mbps int64) int64 {
+	return mbps * 1024 * 1024 / 8
+}
+
+// bytesToMB 将字节转换为MB
+func bytesToMB(bytes int64) float64 {
+	return float64(bytes) / 1024 / 1024
+}
+
+// bytesPerSecToMbps 将字节/秒转换为Mbps
+func bytesPerSecToMbps(bytesPerSec int64) float64 {
+	return float64(bytesPerSec) * 8 / 1024 / 1024
 }
 
 // ConnectionInfo 连接信息
@@ -107,6 +127,10 @@ func loadConfig(configPath string) (*Config, error) {
 		return nil, fmt.Errorf("目标端口必须大于0")
 	}
 
+	// 转换单位：MB -> bytes, Mbps -> bytes/s
+	config.TotalBytes = mbToBytes(config.TotalBytes)
+	config.Bandwidth = mbpsToBytesPerSec(config.Bandwidth)
+
 	return &config, nil
 }
 
@@ -119,8 +143,8 @@ func (s *UDPShooter) createConnections() error {
 	bytesPerConnection := s.config.TotalBytes / int64(totalConnections)
 	bandwidthPerConnection := s.config.Bandwidth / int64(totalConnections)
 
-	s.logManager.GetLogger().Printf("创建 %d 个连接，每个连接流量限制: %d bytes, 带宽限制: %d bytes/s", 
-		totalConnections, bytesPerConnection, bandwidthPerConnection)
+	s.logManager.Log("创建 %d 个连接，每个连接流量限制: %.2f MB, 带宽限制: %.2f Mbps", 
+		totalConnections, bytesToMB(bytesPerConnection), bytesPerSecToMbps(bandwidthPerConnection))
 
 	for _, sourceIP := range s.config.SourceIPs {
 		for _, targetIP := range s.config.TargetIPs {
@@ -152,7 +176,7 @@ func (s *UDPShooter) createConnections() error {
 			}
 
 			s.connections = append(s.connections, connInfo)
-			s.logManager.GetLogger().Printf("创建连接: %s -> %s:%d", sourceIP, targetIP, s.config.TargetPort)
+			s.logManager.Log("创建连接: %s -> %s:%d", sourceIP, targetIP, s.config.TargetPort)
 		}
 	}
 
@@ -182,7 +206,7 @@ func (s *UDPShooter) Start() error {
 
 	// 等待停止信号
 	<-s.stopChan
-	s.logManager.GetLogger().Println("正在停止UDP打流...")
+	s.logManager.Log("正在停止UDP打流...")
 	s.wg.Wait()
 
 	// 关闭所有连接
@@ -211,7 +235,7 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 	var bytesSent int64
 	var lastReport = time.Now()
 
-	s.logManager.GetLogger().Printf("线程 %d-%d 开始工作: %s -> %s:%d", connIndex, threadID, 
+	s.logManager.Log("线程 %d-%d 开始工作: %s -> %s:%d", connIndex, threadID, 
 		connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort)
 
 	for {
@@ -227,14 +251,14 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 
 		// 检查总流量限制
 		if bytesPerConnection > 0 && bytesSent >= bytesPerConnection {
-			s.logManager.GetLogger().Printf("线程 %d-%d 达到流量限制: %d bytes", connIndex, threadID, bytesSent)
+			s.logManager.Log("线程 %d-%d 达到流量限制: %.2f MB", connIndex, threadID, bytesToMB(bytesSent))
 			return
 		}
 
 		// 发送数据包
 		n, err := connInfo.Conn.Write(packet)
 		if err != nil {
-			s.logManager.GetLogger().Printf("线程 %d-%d 发送失败: %v", connIndex, threadID, err)
+			s.logManager.Log("线程 %d-%d 发送失败: %v", connIndex, threadID, err)
 			continue
 		}
 
@@ -258,7 +282,7 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 
 		// 定期报告
 		if time.Since(lastReport) > 10*time.Second {
-			s.logManager.GetLogger().Printf("线程 %d-%d 已发送: %d bytes", connIndex, threadID, bytesSent)
+			s.logManager.Log("线程 %d-%d 已发送: %.2f MB", connIndex, threadID, bytesToMB(bytesSent))
 			lastReport = time.Now()
 		}
 	}
@@ -278,7 +302,7 @@ func (s *UDPShooter) reportStats() {
 			totalBytes := s.totalBytes
 			s.statsLock.RUnlock()
 
-			s.logManager.GetLogger().Printf("总发送流量: %d bytes (%.2f MB)", totalBytes, float64(totalBytes)/1024/1024)
+			s.logManager.Log("总发送流量: %.2f MB", bytesToMB(totalBytes))
 			
 			// 报告每个连接的统计
 			for i, connInfo := range s.connections {
@@ -286,8 +310,8 @@ func (s *UDPShooter) reportStats() {
 				bytesSent := connInfo.BytesSent
 				s.statsLock.RUnlock()
 				
-				s.logManager.GetLogger().Printf("连接 %d (%s -> %s:%d): %d bytes", 
-					i, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesSent)
+				s.logManager.Log("连接 %d (%s -> %s:%d): %.2f MB", 
+					i, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
 			}
 		}
 	}
@@ -305,7 +329,7 @@ func (s *UDPShooter) monitorConfig() {
 		case <-ticker.C:
 			newConfig, err := loadConfig(s.config.ConfigFile)
 			if err != nil {
-				s.logManager.GetLogger().Printf("重新加载配置失败: %v", err)
+				s.logManager.Log("重新加载配置失败: %v", err)
 				continue
 			}
 
@@ -313,7 +337,7 @@ func (s *UDPShooter) monitorConfig() {
 			s.config = newConfig
 			s.configLock.Unlock()
 
-			s.logManager.GetLogger().Println("配置已重新加载")
+			s.logManager.Log("配置已重新加载")
 		}
 	}
 }
@@ -327,6 +351,9 @@ func (s *UDPShooter) Stop() {
 }
 
 func main() {
+	// 打印启动banner和系统信息
+	PrintBanner()
+	
 	configPath := "config.json"
 	if len(os.Args) > 1 {
 		configPath = os.Args[1]

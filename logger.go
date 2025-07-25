@@ -67,9 +67,11 @@ func (lm *LogManager) rotateLog() error {
 	// 设置多输出（同时输出到文件和控制台）
 	multiWriter := io.MultiWriter(os.Stdout, file)
 	lm.currentLog = file
-	lm.logger = log.New(multiWriter, "", log.LstdFlags|log.Lshortfile)
+	// 使用自定义前缀，只显示时间戳和程序名称
+	lm.logger = log.New(multiWriter, "", log.LstdFlags)
 
-	log.Printf("日志文件已轮转: %s", logPath)
+	// 使用标准log输出，因为这是logger内部的消息
+	log.Printf("[UDPshooter] 日志文件已轮转: %s", logPath)
 	return nil
 }
 
@@ -87,11 +89,11 @@ func (lm *LogManager) startLogRotation() {
 			return
 		case <-ticker.C:
 			if err := lm.rotateLog(); err != nil {
-				log.Printf("日志轮转失败: %v", err)
+				log.Printf("[UDPshooter] 日志轮转失败: %v", err)
 			}
 		case <-lm.rotateChan:
 			if err := lm.rotateLog(); err != nil {
-				log.Printf("手动日志轮转失败: %v", err)
+				log.Printf("[UDPshooter] 手动日志轮转失败: %v", err)
 			}
 		}
 	}
@@ -123,7 +125,7 @@ func (lm *LogManager) cleanupOldLogs() {
 	// 遍历日志目录
 	entries, err := os.ReadDir(lm.logDir)
 	if err != nil {
-		log.Printf("读取日志目录失败: %v", err)
+		log.Printf("[UDPshooter] 读取日志目录失败: %v", err)
 		return
 	}
 
@@ -144,7 +146,7 @@ func (lm *LogManager) cleanupOldLogs() {
 		
 		fileTime, err := time.Parse("2006-01-02_15-04-05", timeStr)
 		if err != nil {
-			log.Printf("解析日志文件名时间失败: %s", fileName)
+			log.Printf("[UDPshooter] 解析日志文件名时间失败: %s", fileName)
 			continue
 		}
 
@@ -152,22 +154,28 @@ func (lm *LogManager) cleanupOldLogs() {
 		if fileTime.Before(cutoffTime) {
 			filePath := filepath.Join(lm.logDir, fileName)
 			if err := os.Remove(filePath); err != nil {
-				log.Printf("删除旧日志文件失败: %s, %v", fileName, err)
+				log.Printf("[UDPshooter] 删除旧日志文件失败: %s, %v", fileName, err)
 			} else {
 				deletedCount++
-				log.Printf("已删除旧日志文件: %s", fileName)
+				log.Printf("[UDPshooter] 已删除旧日志文件: %s", fileName)
 			}
 		}
 	}
 
 	if deletedCount > 0 {
-		log.Printf("日志清理完成，删除了 %d 个旧日志文件", deletedCount)
+		log.Printf("[UDPshooter] 日志清理完成，删除了 %d 个旧日志文件", deletedCount)
 	}
 }
 
 // GetLogger 获取日志记录器
 func (lm *LogManager) GetLogger() *log.Logger {
 	return lm.logger
+}
+
+// Log 自定义日志方法，添加UDPshooter标识
+func (lm *LogManager) Log(format string, v ...interface{}) {
+	message := fmt.Sprintf(format, v...)
+	lm.logger.Printf("[UDPshooter] %s", message)
 }
 
 // RotateLog 手动触发日志轮转
@@ -187,5 +195,5 @@ func (lm *LogManager) Stop() {
 		lm.currentLog.Close()
 	}
 	
-	log.Println("日志管理器已停止")
+	log.Println("[UDPshooter] 日志管理器已停止")
 } 
