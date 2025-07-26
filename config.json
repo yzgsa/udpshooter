@@ -1,18 +1,20 @@
 {
     "source_ips": [
-        "2409:8a55:2e9f:9270:fd:2ec0:77d8:a517",
-        "192.168.1.31"
+        "0.0.0.0",
+        "::"
     ],
     "target_ips": [
-        "2409:8a55:2e9f:9270:b0f3:b3ce:e15e:96a8",
+        "192.168.1.52",
         "192.168.1.75"
     ],
     "target_port": 8080,
-    "bandwidth": 1000,
-    "total_bytes": 10240,
+    "bandwidth": 100,
+    "total_bytes": 1024,
     "thread_count": 4,
     "packet_size": 1024,
     "config_file": "config.json",
     "reload_interval": 30,
-    "log_dir": "logs"
+    "log_dir": "logs",
+    "retry_interval": 100,
+    "max_retries": 3
 }

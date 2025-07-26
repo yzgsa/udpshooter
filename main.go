@@ -25,6 +25,8 @@ type Config struct {
 	ConfigFile    string   `json:"config_file"`     // 配置文件路径
 	ReloadInterval int     `json:"reload_interval"` // 配置重载间隔(秒)
 	LogDir        string   `json:"log_dir"`         // 日志目录
+	RetryInterval int      `json:"retry_interval"`  // 重试间隔(毫秒)
+	MaxRetries    int      `json:"max_retries"`     // 最大重试次数
 }
 
 // mbToBytes 将MB转换为字节
@@ -121,6 +123,8 @@ type ConnectionInfo struct {
 	BytesSent  int64
 	StartTime  time.Time
 	Protocol   string // 网络协议 (udp/udp6)
+	LastError  error  // 最后一次错误
+	RetryCount int    // 重试次数
 }
 
 // UDPShooter UDP打流器
@@ -181,6 +185,12 @@ func loadConfig(configPath string) (*Config, error) {
 	}
 	if config.LogDir == "" {
 		config.LogDir = "logs"
+	}
+	if config.RetryInterval <= 0 {
+		config.RetryInterval = 100 // 默认100ms重试间隔
+	}
+	if config.MaxRetries <= 0 {
+		config.MaxRetries = 3 // 默认最大重试3次
 	}
 
 	// 验证配置
@@ -299,7 +309,8 @@ func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string,
 	}
 
 	var laddr *net.UDPAddr
-	if sourceIP != "" {
+	// 只有当源IP不为空且不是通配符地址时才绑定源地址
+	if sourceIP != "" && sourceIP != "0.0.0.0" && sourceIP != "::" {
 		// 对于源地址绑定，我们需要指定一个端口，让系统自动分配
 		if protocol == "udp6" {
 			// IPv6地址需要用方括号包围
@@ -312,6 +323,9 @@ func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string,
 			s.logManager.Log("警告: 无法绑定源地址 %s，将使用系统默认地址: %v", sourceIP, err)
 			laddr = nil
 		}
+	} else {
+		// 对于通配符地址，不绑定源地址，让系统自动选择
+		laddr = nil
 	}
 
 	conn, err := net.DialUDP(protocol, laddr, raddr)
@@ -322,6 +336,11 @@ func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string,
 	// 验证连接是否成功建立
 	if conn == nil {
 		return fmt.Errorf("UDP连接创建失败: 连接对象为空")
+	}
+
+	// 设置连接参数以优化公网性能
+	if err := s.optimizeConnection(conn); err != nil {
+		s.logManager.Log("警告: 优化连接参数失败: %v", err)
 	}
 
 	connInfo := &ConnectionInfo{
@@ -335,6 +354,87 @@ func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string,
 
 	s.connections = append(s.connections, connInfo)
 	s.logManager.Log("创建连接: %s -> %s:%d (协议: %s)", sourceIP, targetIP, s.config.TargetPort, protocol)
+	
+	return nil
+}
+
+// optimizeConnection 优化连接参数
+func (s *UDPShooter) optimizeConnection(conn *net.UDPConn) error {
+	// 设置发送缓冲区大小
+	if err := conn.SetWriteBuffer(1024 * 1024); err != nil {
+		return fmt.Errorf("设置发送缓冲区失败: %v", err)
+	}
+	
+	// 设置接收缓冲区大小（虽然UDP不需要接收，但设置可以避免某些问题）
+	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
+		return fmt.Errorf("设置接收缓冲区失败: %v", err)
+	}
+	
+	return nil
+}
+
+// recreateConnection 重新创建UDP连接
+func (s *UDPShooter) recreateConnection(connInfo *ConnectionInfo) error {
+	// 关闭旧连接
+	if connInfo.Conn != nil {
+		connInfo.Conn.Close()
+	}
+	
+	// 等待一小段时间让系统释放资源
+	time.Sleep(100 * time.Millisecond)
+	
+	// 重新创建连接
+	var raddr *net.UDPAddr
+	var err error
+	
+	if connInfo.Protocol == "udp6" {
+		// IPv6地址需要用方括号包围
+		raddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("[%s]:%d", connInfo.TargetIP, connInfo.TargetPort))
+	} else {
+		raddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("%s:%d", connInfo.TargetIP, connInfo.TargetPort))
+	}
+	if err != nil {
+		return fmt.Errorf("重新解析目标地址失败: %v", err)
+	}
+
+	var laddr *net.UDPAddr
+	if connInfo.SourceIP != "" && connInfo.SourceIP != "0.0.0.0" && connInfo.SourceIP != "::" {
+		// 对于源地址绑定，我们需要指定一个端口，让系统自动分配
+		if connInfo.Protocol == "udp6" {
+			// IPv6地址需要用方括号包围
+			laddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("[%s]:0", connInfo.SourceIP))
+		} else {
+			laddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("%s:0", connInfo.SourceIP))
+		}
+		if err != nil {
+			// 如果源地址绑定失败，尝试不绑定源地址
+			s.logManager.Log("警告: 重新绑定源地址 %s 失败，将使用系统默认地址: %v", connInfo.SourceIP, err)
+			laddr = nil
+		}
+	}
+
+	conn, err := net.DialUDP(connInfo.Protocol, laddr, raddr)
+	if err != nil {
+		return fmt.Errorf("重新创建UDP连接失败 %s -> %s:%d: %v", connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err)
+	}
+	
+	// 验证连接是否成功建立
+	if conn == nil {
+		return fmt.Errorf("UDP连接重新创建失败: 连接对象为空")
+	}
+
+	// 设置连接参数以优化公网性能
+	if err := s.optimizeConnection(conn); err != nil {
+		s.logManager.Log("警告: 重新优化连接参数失败: %v", err)
+	}
+
+	// 更新连接信息
+	connInfo.Conn = conn
+	connInfo.StartTime = time.Now()
+	connInfo.LastError = nil
+	connInfo.RetryCount = 0
+	
+	s.logManager.Log("连接已重新创建: %s -> %s:%d (协议: %s)", connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, connInfo.Protocol)
 	
 	return nil
 }
@@ -390,6 +490,7 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 
 	var bytesSent int64
 	var lastReport = time.Now()
+	var consecutiveErrors int
 
 	s.logManager.Log("线程 %d-%d 开始工作: %s -> %s:%d (协议: %s)", connIndex, threadID, 
 		connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, connInfo.Protocol)
@@ -415,10 +516,60 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 		// 发送数据包
 		n, err := connInfo.Conn.Write(packet)
 		if err != nil {
-			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 发送失败: %v", 
-				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err)
+			consecutiveErrors++
+			connInfo.LastError = err
+			connInfo.RetryCount++
+			
+			// 分析错误类型，采用不同的处理策略
+			errStr := err.Error()
+			isNetworkError := strings.Contains(errStr, "no route to host") || 
+							  strings.Contains(errStr, "network is unreachable") ||
+							  strings.Contains(errStr, "connection refused") ||
+							  strings.Contains(errStr, "host unreachable")
+			
+			// 对于网络错误，采用指数退避策略
+			var sleepTime time.Duration
+			if isNetworkError {
+				// 网络错误使用指数退避，但限制最大等待时间
+				backoffTime := time.Duration(s.config.RetryInterval) * time.Millisecond * time.Duration(1<<consecutiveErrors)
+				if backoffTime > 5*time.Second {
+					backoffTime = 5 * time.Second
+				}
+				sleepTime = backoffTime
+				
+				// 如果连续网络错误过多，尝试重新创建连接
+				if consecutiveErrors > s.config.MaxRetries*2 {
+					s.logManager.Log("线程 %d-%d (%s -> %s:%d) 连续网络错误过多，尝试重新创建连接", 
+						connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort)
+					
+					if err := s.recreateConnection(connInfo); err != nil {
+						s.logManager.Log("线程 %d-%d 重新创建连接失败: %v", connIndex, threadID, err)
+						time.Sleep(10 * time.Second) // 等待更长时间再重试
+						continue
+					}
+					consecutiveErrors = 0
+					s.logManager.Log("线程 %d-%d 连接已重新创建", connIndex, threadID)
+				}
+			} else {
+				// 其他错误使用固定间隔重试
+				if consecutiveErrors > s.config.MaxRetries {
+					sleepTime = time.Duration(s.config.RetryInterval) * time.Millisecond * time.Duration(consecutiveErrors)
+				} else {
+					sleepTime = time.Duration(s.config.RetryInterval) * time.Millisecond
+				}
+			}
+			
+			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 发送失败: %v (连续错误: %d, 等待: %v)", 
+				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err, consecutiveErrors, sleepTime)
+			
+			time.Sleep(sleepTime)
 			continue
 		}
+
+		// 重置错误计数
+		consecutiveErrors = 0
+		connInfo.LastError = nil
+		connInfo.RetryCount = 0
 
 		bytesSent += int64(n)
 		
@@ -428,12 +579,22 @@ func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
 		s.totalBytes += int64(n)
 		s.statsLock.Unlock()
 
-		// 带宽限制
+		// 改进的带宽限制算法
 		if bandwidthPerConnection > 0 {
-			elapsed := time.Since(connInfo.StartTime).Seconds()
+			now := time.Now()
+			elapsed := now.Sub(connInfo.StartTime).Seconds()
 			expectedBytes := int64(elapsed * float64(bandwidthPerConnection))
+			
 			if bytesSent > expectedBytes {
-				sleepTime := time.Duration(float64(bytesSent-expectedBytes) / float64(bandwidthPerConnection) * float64(time.Second))
+				// 计算需要等待的时间
+				excessBytes := bytesSent - expectedBytes
+				sleepTime := time.Duration(float64(excessBytes) / float64(bandwidthPerConnection) * float64(time.Second))
+				
+				// 限制最大睡眠时间，避免过度延迟
+				if sleepTime > 100*time.Millisecond {
+					sleepTime = 100 * time.Millisecond
+				}
+				
 				time.Sleep(sleepTime)
 			}
 		}
@@ -469,8 +630,13 @@ func (s *UDPShooter) reportStats() {
 				bytesSent := connInfo.BytesSent
 				s.statsLock.RUnlock()
 				
-				s.logManager.Log("连接 %d (%s -> %s:%d): %.2f MB", 
-					i, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
+				status := "正常"
+				if connInfo.LastError != nil {
+					status = fmt.Sprintf("错误: %v", connInfo.LastError)
+				}
+				
+				s.logManager.Log("连接 %d (%s -> %s:%d): %.2f MB, 状态: %s, 重试次数: %d", 
+					i, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent), status, connInfo.RetryCount)
 			}
 		}
 	}
