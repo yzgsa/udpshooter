@@ -1,20 +1,36 @@
 {
+    "targets": [
+        {
+            "host": "183.94.165.197",
+            "port": 5888
+        },
+        {
+            "host": "2408:864e:8000:105:1::20",
+            "port": 5889
+        }
+    ],
+    "bandwidth": {
+        "max_bandwidth_mbps": 15000,
+        "max_bytes": 0
+    },
     "source_ips": [
-        "0.0.0.0",
-        "::"
+        "183.94.165.196",
+        "2408:864e:8000:105:1::40"
     ],
-    "target_ips": [
-        "192.168.1.52",
-        "192.168.1.75"
-    ],
-    "target_port": 8080,
-    "bandwidth": 100,
-    "total_bytes": 1024,
-    "thread_count": 4,
-    "packet_size": 1024,
-    "config_file": "config.json",
-    "reload_interval": 30,
-    "log_dir": "logs",
-    "retry_interval": 100,
-    "max_retries": 3
+    "packet": {
+        "size": 1400,
+        "payload_pattern": "UDP_SHOOTER"
+    },
+    "concurrency": {
+        "workers_per_ip": 10,
+        "buffer_size": 131072
+    },
+    "logging": {
+        "level": "info",
+        "file": "logs/udpshooter.log",
+        "max_size_mb": 100,
+        "max_backups": 7,
+        "max_age_days": 7,
+        "compress": true
+    }
 }

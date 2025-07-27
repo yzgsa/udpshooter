@@ -1,705 +1,479 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"os"
 	"os/signal"
+	"runtime"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"syscall"
 	"time"
+
+	"github.com/sirupsen/logrus"
+	"gopkg.in/natefinch/lumberjack.v2"
 )
+
+// Target 目标配置结构体
+type Target struct {
+	Host string `json:"host"` // 支持IPv4和IPv6
+	Port int    `json:"port"`
+}
 
 // Config 配置结构体
 type Config struct {
-	SourceIPs     []string `json:"source_ips"`      // 源IP地址列表
-	TargetIPs     []string `json:"target_ips"`      // 目标IP地址列表
-	TargetPort    int      `json:"target_port"`     // 目标端口
-	Bandwidth     int64    `json:"bandwidth"`       // 总带宽限制 (Mbps)
-	TotalBytes    int64    `json:"total_bytes"`     // 总流量限制 (MB)
-	ThreadCount   int      `json:"thread_count"`    // 每个连接的线程数量
-	PacketSize    int      `json:"packet_size"`     // 数据包大小
-	ConfigFile    string   `json:"config_file"`     // 配置文件路径
-	ReloadInterval int     `json:"reload_interval"` // 配置重载间隔(秒)
-	LogDir        string   `json:"log_dir"`         // 日志目录
-	RetryInterval int      `json:"retry_interval"`  // 重试间隔(毫秒)
-	MaxRetries    int      `json:"max_retries"`     // 最大重试次数
+	Targets []Target `json:"targets"`
+	Bandwidth struct {
+		MaxBandwidthMbps int64 `json:"max_bandwidth_mbps"`
+		MaxBytes         int64 `json:"max_bytes"`
+	} `json:"bandwidth"`
+	SourceIPs []string `json:"source_ips"`
+	Packet    struct {
+		Size           int    `json:"size"`
+		PayloadPattern string `json:"payload_pattern"`
+	} `json:"packet"`
+	Concurrency struct {
+		WorkersPerIP int `json:"workers_per_ip"`
+		BufferSize   int `json:"buffer_size"`
+	} `json:"concurrency"`
+	Logging struct {
+		Level      string `json:"level"`
+		File       string `json:"file"`
+		MaxSizeMB  int    `json:"max_size_mb"`
+		MaxBackups int    `json:"max_backups"`
+		MaxAgeDays int    `json:"max_age_days"`
+		Compress   bool   `json:"compress"`
+	} `json:"logging"`
 }
 
-// mbToBytes 将MB转换为字节
-func mbToBytes(mb int64) int64 {
-	return mb * 1024 * 1024
-}
-
-// mbpsToBytesPerSec 将Mbps转换为字节/秒
-func mbpsToBytesPerSec(mbps int64) int64 {
-	return mbps * 1024 * 1024 / 8
-}
-
-// bytesToMB 将字节转换为MB
-func bytesToMB(bytes int64) float64 {
-	return float64(bytes) / 1024 / 1024
-}
-
-// bytesPerSecToMbps 将字节/秒转换为Mbps
-func bytesPerSecToMbps(bytesPerSec int64) float64 {
-	return float64(bytesPerSec) * 8 / 1024 / 1024
-}
-
-// isIPv6 检查IP地址是否为IPv6
-func isIPv6(ip string) bool {
-	return strings.Contains(ip, ":")
-}
-
-// validateIP 验证IP地址格式
-func validateIP(ip string) error {
-	if ip == "" {
-		return nil // 空IP表示使用默认
-	}
-	
-	parsedIP := net.ParseIP(ip)
-	if parsedIP == nil {
-		return fmt.Errorf("无效的IP地址格式: %s", ip)
-	}
-	
-	return nil
-}
-
-// checkLocalIP 检查IP是否为本地IP地址
-func checkLocalIP(ip string) error {
-	if ip == "" {
-		return nil
-	}
-	
-	// 获取所有网络接口
-	interfaces, err := net.Interfaces()
-	if err != nil {
-		return fmt.Errorf("获取网络接口失败: %v", err)
-	}
-	
-	// 检查IP是否在本地接口上
-	for _, iface := range interfaces {
-		addrs, err := iface.Addrs()
-		if err != nil {
-			continue
-		}
-		
-		for _, addr := range addrs {
-			switch v := addr.(type) {
-			case *net.IPNet:
-				if v.IP.String() == ip {
-					return nil // 找到匹配的本地IP
-				}
-			case *net.IPAddr:
-				if v.IP.String() == ip {
-					return nil // 找到匹配的本地IP
-				}
-			}
-		}
-	}
-	
-	// 如果没找到，可能是因为网络接口状态问题，暂时跳过验证
-	// 在实际连接时会再次验证
-	return nil
-}
-
-// getNetworkProtocol 根据IP地址获取网络协议
-func getNetworkProtocol(ip string) string {
-	if isIPv6(ip) {
-		return "udp6"
-	}
-	return "udp"
-}
-
-// ConnectionInfo 连接信息
-type ConnectionInfo struct {
-	SourceIP   string
-	TargetIP   string
-	TargetPort int
-	Conn       *net.UDPConn
-	BytesSent  int64
-	StartTime  time.Time
-	Protocol   string // 网络协议 (udp/udp6)
-	LastError  error  // 最后一次错误
-	RetryCount int    // 重试次数
-}
-
-// UDPShooter UDP打流器
+// UDPShooter UDP打流器结构体
 type UDPShooter struct {
-	config       *Config
-	connections  []*ConnectionInfo
-	stopChan     chan struct{}
-	wg           sync.WaitGroup
-	configLock   sync.RWMutex
-	logManager   *LogManager
-	statsLock    sync.RWMutex
-	totalBytes   int64
+	config           *Config
+	logger           *logrus.Logger
+	stats            *Stats
+	ctx              context.Context
+	cancel           context.CancelFunc
+	wg               sync.WaitGroup
+	startTime        time.Time
+	totalBytes       int64
+	packetPool       *OptimizedPacketPool
+	networkOptimizer *NetworkOptimizer
 }
 
-// NewUDPShooter 创建新的UDP打流器
-func NewUDPShooter(configPath string) (*UDPShooter, error) {
-	config, err := loadConfig(configPath)
-	if err != nil {
-		return nil, fmt.Errorf("加载配置失败: %v", err)
-	}
+// Stats 统计信息结构体
+type Stats struct {
+	mu           sync.RWMutex
+	bytesSent    int64
+	packetsSent  int64
+	startTime    time.Time
+	lastLogTime  time.Time
+	bandwidthMbps float64
+}
 
-	// 创建日志管理器
-	logManager, err := NewLogManager(config.LogDir)
-	if err != nil {
-		return nil, fmt.Errorf("创建日志管理器失败: %v", err)
+// NewUDPShooter 创建新的UDP打流器实例
+// :param config: 配置信息
+// :param logger: 日志记录器
+// :return: UDP打流器实例
+func NewUDPShooter(config *Config, logger *logrus.Logger) *UDPShooter {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &UDPShooter{
+		config:           config,
+		logger:           logger,
+		stats:            &Stats{startTime: time.Now(), lastLogTime: time.Now()},
+		ctx:              ctx,
+		cancel:           cancel,
+		startTime:        time.Now(),
+		packetPool:       NewOptimizedPacketPool(),
+		networkOptimizer: NewNetworkOptimizer(),
 	}
-
-	shooter := &UDPShooter{
-		config:     config,
-		stopChan:   make(chan struct{}),
-		logManager: logManager,
-	}
-
-	return shooter, nil
 }
 
 // loadConfig 加载配置文件
-func loadConfig(configPath string) (*Config, error) {
-	data, err := os.ReadFile(configPath)
+// :param filename: 配置文件路径
+// :return: 配置结构体和错误信息
+func loadConfig(filename string) (*Config, error) {
+	data, err := os.ReadFile(filename)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("读取配置文件失败: %v", err)
 	}
 
 	var config Config
 	if err := json.Unmarshal(data, &config); err != nil {
-		return nil, err
+		return nil, fmt.Errorf("解析配置文件失败: %v", err)
 	}
-
-	// 设置默认值
-	if config.ThreadCount <= 0 {
-		config.ThreadCount = 4
-	}
-	if config.PacketSize <= 0 {
-		config.PacketSize = 1024
-	}
-	if config.ReloadInterval <= 0 {
-		config.ReloadInterval = 30
-	}
-	if config.LogDir == "" {
-		config.LogDir = "logs"
-	}
-	if config.RetryInterval <= 0 {
-		config.RetryInterval = 100 // 默认100ms重试间隔
-	}
-	if config.MaxRetries <= 0 {
-		config.MaxRetries = 3 // 默认最大重试3次
-	}
-
-	// 验证配置
-	if len(config.SourceIPs) == 0 {
-		return nil, fmt.Errorf("至少需要指定一个源IP")
-	}
-	if len(config.TargetIPs) == 0 {
-		return nil, fmt.Errorf("至少需要指定一个目标IP")
-	}
-	if config.TargetPort <= 0 {
-		return nil, fmt.Errorf("目标端口必须大于0")
-	}
-
-	// 验证IP地址格式
-	for i, sourceIP := range config.SourceIPs {
-		if err := validateIP(sourceIP); err != nil {
-			return nil, fmt.Errorf("源IP %d (%s): %v", i+1, sourceIP, err)
-		}
-		// 验证源IP是否为本地IP地址
-		if err := checkLocalIP(sourceIP); err != nil {
-			return nil, fmt.Errorf("源IP %d (%s): %v", i+1, sourceIP, err)
-		}
-	}
-	
-	for i, targetIP := range config.TargetIPs {
-		if err := validateIP(targetIP); err != nil {
-			return nil, fmt.Errorf("目标IP %d (%s): %v", i+1, targetIP, err)
-		}
-	}
-
-	// 转换单位：MB -> bytes, Mbps -> bytes/s
-	config.TotalBytes = mbToBytes(config.TotalBytes)
-	config.Bandwidth = mbpsToBytesPerSec(config.Bandwidth)
 
 	return &config, nil
 }
 
-// createConnections 创建所有连接
-func (s *UDPShooter) createConnections() error {
-	s.connections = make([]*ConnectionInfo, 0)
+// setupLogger 设置日志记录器
+// :param config: 日志配置
+// :return: 日志记录器
+func setupLogger(config *Config) *logrus.Logger {
+	logger := logrus.New()
 	
-	// 按IP版本分组源IP和目标IP
-	var sourceIPv4, sourceIPv6, targetIPv4, targetIPv6 []string
-	
-	for _, sourceIP := range s.config.SourceIPs {
-		if isIPv6(sourceIP) {
-			sourceIPv6 = append(sourceIPv6, sourceIP)
-		} else {
-			sourceIPv4 = append(sourceIPv4, sourceIP)
-		}
+	// 设置日志级别
+	level, err := logrus.ParseLevel(config.Logging.Level)
+	if err != nil {
+		level = logrus.InfoLevel
 	}
-	
-	for _, targetIP := range s.config.TargetIPs {
-		if isIPv6(targetIP) {
-			targetIPv6 = append(targetIPv6, targetIP)
-		} else {
-			targetIPv4 = append(targetIPv4, targetIP)
-		}
-	}
-	
-	// 创建IPv4连接
-	ipv4Connections := len(sourceIPv4) * len(targetIPv4)
-	// 创建IPv6连接
-	ipv6Connections := len(sourceIPv6) * len(targetIPv6)
-	
-	totalConnections := ipv4Connections + ipv6Connections
-	if totalConnections == 0 {
-		return fmt.Errorf("没有找到兼容的IPv4或IPv6连接对")
-	}
-	
-	bytesPerConnection := s.config.TotalBytes / int64(totalConnections)
-	bandwidthPerConnection := s.config.Bandwidth / int64(totalConnections)
+	logger.SetLevel(level)
 
-	s.logManager.Log("创建连接 - IPv4: %d个, IPv6: %d个, 总计: %d个", 
-		ipv4Connections, ipv6Connections, totalConnections)
-	s.logManager.Log("每个连接流量限制: %.2f MB, 带宽限制: %.2f Mbps", 
-		bytesToMB(bytesPerConnection), bytesPerSecToMbps(bandwidthPerConnection))
+	// 设置日志格式
+	logger.SetFormatter(&logrus.TextFormatter{
+		FullTimestamp:   true,
+		TimestampFormat: "2006-01-02 15:04:05",
+		ForceColors:     true,
+	})
 
-	// 创建IPv4连接
-	for _, sourceIP := range sourceIPv4 {
-		for _, targetIP := range targetIPv4 {
-			if err := s.createSingleConnection(sourceIP, targetIP, "udp", bytesPerConnection, bandwidthPerConnection); err != nil {
-				return err
-			}
-		}
+	// 创建多输出writer，同时输出到文件和控制台
+	fileWriter := &lumberjack.Logger{
+		Filename:   config.Logging.File,
+		MaxSize:    config.Logging.MaxSizeMB,
+		MaxBackups: config.Logging.MaxBackups,
+		MaxAge:     config.Logging.MaxAgeDays,
+		Compress:   config.Logging.Compress,
 	}
 	
-	// 创建IPv6连接
-	for _, sourceIP := range sourceIPv6 {
-		for _, targetIP := range targetIPv6 {
-			if err := s.createSingleConnection(sourceIP, targetIP, "udp6", bytesPerConnection, bandwidthPerConnection); err != nil {
-				return err
-			}
-		}
-	}
+	// 同时输出到文件和控制台
+	logger.SetOutput(io.MultiWriter(os.Stdout, fileWriter))
 
-	return nil
+	return logger
 }
 
-// createSingleConnection 创建单个连接
-func (s *UDPShooter) createSingleConnection(sourceIP, targetIP, protocol string, bytesPerConnection, bandwidthPerConnection int64) error {
-	// 创建UDP连接
-	var raddr *net.UDPAddr
-	var err error
+// createPacket 创建UDP数据包
+// :param size: 数据包大小
+// :param pattern: 负载模式
+// :return: 数据包字节数组
+func createPacket(size int, pattern string) []byte {
+	packet := make([]byte, size)
 	
-	if protocol == "udp6" {
-		// IPv6地址需要用方括号包围
-		raddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("[%s]:%d", targetIP, s.config.TargetPort))
-	} else {
-		raddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("%s:%d", targetIP, s.config.TargetPort))
+	// 填充模式字符串
+	patternBytes := []byte(pattern)
+	for i := 0; i < size; i++ {
+		packet[i] = patternBytes[i%len(patternBytes)]
 	}
-	if err != nil {
-		// 如果目标地址解析失败，记录警告但继续尝试
-		s.logManager.Log("警告: 无法解析目标地址 %s:%d: %v", targetIP, s.config.TargetPort, err)
-		return nil
-	}
+	
+	return packet
+}
 
-	var laddr *net.UDPAddr
-	// 只有当源IP不为空且不是通配符地址时才绑定源地址
-	if sourceIP != "" && sourceIP != "0.0.0.0" && sourceIP != "::" {
-		// 对于源地址绑定，我们需要指定一个端口，让系统自动分配
-		if protocol == "udp6" {
-			// IPv6地址需要用方括号包围
-			laddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("[%s]:0", sourceIP))
-		} else {
-			laddr, err = net.ResolveUDPAddr(protocol, fmt.Sprintf("%s:0", sourceIP))
-		}
+// sendPackets 发送数据包的工作协程
+// :param sourceIP: 源IP地址
+// :param targetAddrs: 目标地址列表
+// :param packetTemplate: 数据包模板
+// :param rateLimiter: 速率限制器
+func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, packetTemplate []byte, rateLimiter *RateLimiter) {
+	defer u.wg.Done()
+
+	// 为每个目标创建UDP连接
+	connections := make([]*net.UDPConn, len(targetAddrs))
+	for i, targetAddr := range targetAddrs {
+		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(sourceIP)}, targetAddr)
 		if err != nil {
-			// 如果源地址绑定失败，尝试不绑定源地址
-			s.logManager.Log("警告: 无法绑定源地址 %s，将使用系统默认地址: %v", sourceIP, err)
-			laddr = nil
-		}
-	} else {
-		// 对于通配符地址，不绑定源地址，让系统自动选择
-		laddr = nil
-	}
-
-	conn, err := net.DialUDP(protocol, laddr, raddr)
-	if err != nil {
-		return fmt.Errorf("创建UDP连接失败 %s -> %s:%d: %v", sourceIP, targetIP, s.config.TargetPort, err)
-	}
-	
-	// 验证连接是否成功建立
-	if conn == nil {
-		return fmt.Errorf("UDP连接创建失败: 连接对象为空")
-	}
-
-	// 设置连接参数以优化公网性能
-	if err := s.optimizeConnection(conn); err != nil {
-		s.logManager.Log("警告: 优化连接参数失败: %v", err)
-	}
-
-	connInfo := &ConnectionInfo{
-		SourceIP:   sourceIP,
-		TargetIP:   targetIP,
-		TargetPort: s.config.TargetPort,
-		Conn:       conn,
-		StartTime:  time.Now(),
-		Protocol:   protocol,
-	}
-
-	s.connections = append(s.connections, connInfo)
-	s.logManager.Log("创建连接: %s -> %s:%d (协议: %s)", sourceIP, targetIP, s.config.TargetPort, protocol)
-	
-	return nil
-}
-
-// optimizeConnection 优化连接参数
-func (s *UDPShooter) optimizeConnection(conn *net.UDPConn) error {
-	// 设置发送缓冲区大小
-	if err := conn.SetWriteBuffer(1024 * 1024); err != nil {
-		return fmt.Errorf("设置发送缓冲区失败: %v", err)
-	}
-	
-	// 设置接收缓冲区大小（虽然UDP不需要接收，但设置可以避免某些问题）
-	if err := conn.SetReadBuffer(1024 * 1024); err != nil {
-		return fmt.Errorf("设置接收缓冲区失败: %v", err)
-	}
-	
-	return nil
-}
-
-// recreateConnection 重新创建UDP连接
-func (s *UDPShooter) recreateConnection(connInfo *ConnectionInfo) error {
-	// 关闭旧连接
-	if connInfo.Conn != nil {
-		connInfo.Conn.Close()
-	}
-	
-	// 等待一小段时间让系统释放资源
-	time.Sleep(100 * time.Millisecond)
-	
-	// 重新创建连接
-	var raddr *net.UDPAddr
-	var err error
-	
-	if connInfo.Protocol == "udp6" {
-		// IPv6地址需要用方括号包围
-		raddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("[%s]:%d", connInfo.TargetIP, connInfo.TargetPort))
-	} else {
-		raddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("%s:%d", connInfo.TargetIP, connInfo.TargetPort))
-	}
-	if err != nil {
-		return fmt.Errorf("重新解析目标地址失败: %v", err)
-	}
-
-	var laddr *net.UDPAddr
-	if connInfo.SourceIP != "" && connInfo.SourceIP != "0.0.0.0" && connInfo.SourceIP != "::" {
-		// 对于源地址绑定，我们需要指定一个端口，让系统自动分配
-		if connInfo.Protocol == "udp6" {
-			// IPv6地址需要用方括号包围
-			laddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("[%s]:0", connInfo.SourceIP))
-		} else {
-			laddr, err = net.ResolveUDPAddr(connInfo.Protocol, fmt.Sprintf("%s:0", connInfo.SourceIP))
-		}
-		if err != nil {
-			// 如果源地址绑定失败，尝试不绑定源地址
-			s.logManager.Log("警告: 重新绑定源地址 %s 失败，将使用系统默认地址: %v", connInfo.SourceIP, err)
-			laddr = nil
-		}
-	}
-
-	conn, err := net.DialUDP(connInfo.Protocol, laddr, raddr)
-	if err != nil {
-		return fmt.Errorf("重新创建UDP连接失败 %s -> %s:%d: %v", connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err)
-	}
-	
-	// 验证连接是否成功建立
-	if conn == nil {
-		return fmt.Errorf("UDP连接重新创建失败: 连接对象为空")
-	}
-
-	// 设置连接参数以优化公网性能
-	if err := s.optimizeConnection(conn); err != nil {
-		s.logManager.Log("警告: 重新优化连接参数失败: %v", err)
-	}
-
-	// 更新连接信息
-	connInfo.Conn = conn
-	connInfo.StartTime = time.Now()
-	connInfo.LastError = nil
-	connInfo.RetryCount = 0
-	
-	s.logManager.Log("连接已重新创建: %s -> %s:%d (协议: %s)", connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, connInfo.Protocol)
-	
-	return nil
-}
-
-// Start 启动UDP打流
-func (s *UDPShooter) Start() error {
-	// 创建所有连接
-	if err := s.createConnections(); err != nil {
-		return err
-	}
-
-	// 启动配置监控
-	go s.monitorConfig()
-
-	// 为每个连接启动工作线程
-	for i, connInfo := range s.connections {
-		for j := 0; j < s.config.ThreadCount; j++ {
-			s.wg.Add(1)
-			go s.worker(i, j, connInfo)
-		}
-	}
-
-	// 启动统计报告
-	go s.reportStats()
-
-	// 等待停止信号
-	<-s.stopChan
-	s.logManager.Log("正在停止UDP打流...")
-	s.wg.Wait()
-
-	// 关闭所有连接
-	for _, connInfo := range s.connections {
-		connInfo.Conn.Close()
-	}
-
-	return nil
-}
-
-// worker 工作线程函数
-func (s *UDPShooter) worker(connIndex, threadID int, connInfo *ConnectionInfo) {
-	defer s.wg.Done()
-
-	// 创建数据包
-	packet := make([]byte, s.config.PacketSize)
-	for i := range packet {
-		packet[i] = byte(i % 256)
-	}
-
-	// 计算该连接的流量限制
-	totalConnections := len(s.connections)
-	bytesPerConnection := s.config.TotalBytes / int64(totalConnections)
-	bandwidthPerConnection := s.config.Bandwidth / int64(totalConnections)
-
-	var bytesSent int64
-	var lastReport = time.Now()
-	var consecutiveErrors int
-
-	s.logManager.Log("线程 %d-%d 开始工作: %s -> %s:%d (协议: %s)", connIndex, threadID, 
-		connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, connInfo.Protocol)
-
-	for {
-		select {
-		case <-s.stopChan:
-			return
-		default:
-		}
-
-		s.configLock.RLock()
-		_ = s.config
-		s.configLock.RUnlock()
-
-		// 检查总流量限制
-		if bytesPerConnection > 0 && bytesSent >= bytesPerConnection {
-			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 达到流量限制: %.2f MB", 
-				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
-			return
-		}
-
-		// 发送数据包
-		n, err := connInfo.Conn.Write(packet)
-		if err != nil {
-			consecutiveErrors++
-			connInfo.LastError = err
-			connInfo.RetryCount++
-			
-			// 分析错误类型，采用不同的处理策略
-			errStr := err.Error()
-			isNetworkError := strings.Contains(errStr, "no route to host") || 
-							  strings.Contains(errStr, "network is unreachable") ||
-							  strings.Contains(errStr, "connection refused") ||
-							  strings.Contains(errStr, "host unreachable")
-			
-			// 对于网络错误，采用指数退避策略
-			var sleepTime time.Duration
-			if isNetworkError {
-				// 网络错误使用指数退避，但限制最大等待时间
-				backoffTime := time.Duration(s.config.RetryInterval) * time.Millisecond * time.Duration(1<<consecutiveErrors)
-				if backoffTime > 5*time.Second {
-					backoffTime = 5 * time.Second
-				}
-				sleepTime = backoffTime
-				
-				// 如果连续网络错误过多，尝试重新创建连接
-				if consecutiveErrors > s.config.MaxRetries*2 {
-					s.logManager.Log("线程 %d-%d (%s -> %s:%d) 连续网络错误过多，尝试重新创建连接", 
-						connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort)
-					
-					if err := s.recreateConnection(connInfo); err != nil {
-						s.logManager.Log("线程 %d-%d 重新创建连接失败: %v", connIndex, threadID, err)
-						time.Sleep(10 * time.Second) // 等待更长时间再重试
-						continue
-					}
-					consecutiveErrors = 0
-					s.logManager.Log("线程 %d-%d 连接已重新创建", connIndex, threadID)
-				}
-			} else {
-				// 其他错误使用固定间隔重试
-				if consecutiveErrors > s.config.MaxRetries {
-					sleepTime = time.Duration(s.config.RetryInterval) * time.Millisecond * time.Duration(consecutiveErrors)
-				} else {
-					sleepTime = time.Duration(s.config.RetryInterval) * time.Millisecond
-				}
-			}
-			
-			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 发送失败: %v (连续错误: %d, 等待: %v)", 
-				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, err, consecutiveErrors, sleepTime)
-			
-			time.Sleep(sleepTime)
+			u.logger.Errorf("创建UDP连接失败 [%s] -> %s: %v", sourceIP, targetAddr.String(), err)
 			continue
 		}
-
-		// 重置错误计数
-		consecutiveErrors = 0
-		connInfo.LastError = nil
-		connInfo.RetryCount = 0
-
-		bytesSent += int64(n)
 		
-		// 更新连接统计
-		s.statsLock.Lock()
-		connInfo.BytesSent += int64(n)
-		s.totalBytes += int64(n)
-		s.statsLock.Unlock()
-
-		// 改进的带宽限制算法
-		if bandwidthPerConnection > 0 {
-			now := time.Now()
-			elapsed := now.Sub(connInfo.StartTime).Seconds()
-			expectedBytes := int64(elapsed * float64(bandwidthPerConnection))
-			
-			if bytesSent > expectedBytes {
-				// 计算需要等待的时间
-				excessBytes := bytesSent - expectedBytes
-				sleepTime := time.Duration(float64(excessBytes) / float64(bandwidthPerConnection) * float64(time.Second))
-				
-				// 限制最大睡眠时间，避免过度延迟
-				if sleepTime > 100*time.Millisecond {
-					sleepTime = 100 * time.Millisecond
-				}
-				
-				time.Sleep(sleepTime)
-			}
+		// 设置发送缓冲区大小
+		if err := conn.SetWriteBuffer(u.config.Concurrency.BufferSize); err != nil {
+			u.logger.Warnf("设置发送缓冲区失败 [%s] -> %s: %v", sourceIP, targetAddr.String(), err)
 		}
+		
+		connections[i] = conn
+		defer conn.Close()
+	}
 
-		// 定期报告
-		if time.Since(lastReport) > 10*time.Second {
-			s.logManager.Log("线程 %d-%d (%s -> %s:%d) 已发送: %.2f MB", 
-				connIndex, threadID, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent))
-			lastReport = time.Now()
+	if len(connections) == 0 {
+		u.logger.Errorf("没有可用的UDP连接 [%s]", sourceIP)
+		return
+	}
+
+	u.logger.Infof("📤 开始发送 | 源IP: %s | 目标: %d个", sourceIP, len(connections))
+
+	// 创建批量写入器
+	batchWriter := NewBatchWriter(connections, 10)
+
+	// 预分配数据包缓冲区
+	packetSize := len(packetTemplate)
+	packet := u.packetPool.GetPacket(packetSize)
+	defer u.packetPool.PutPacket(packet)
+
+	for {
+		select {
+		case <-u.ctx.Done():
+			return
+		default:
+			// 速率限制
+			if rateLimiter != nil {
+				rateLimiter.Wait()
+			}
+
+			// 快速复制数据包模板
+			copy(packet, packetTemplate)
+			
+			// 批量发送到所有目标
+			batchWriter.WriteSingle(packet)
+
+			// 更新统计信息（原子操作）
+			u.stats.mu.Lock()
+			u.stats.bytesSent += int64(packetSize)
+			u.stats.packetsSent++
+			u.stats.mu.Unlock()
 		}
 	}
 }
 
-// reportStats 定期报告统计信息
-func (s *UDPShooter) reportStats() {
-	ticker := time.NewTicker(30 * time.Second)
+// logStats 记录统计信息
+func (u *UDPShooter) logStats() {
+	ticker := time.NewTicker(10 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
-		case <-s.stopChan:
+		case <-u.ctx.Done():
 			return
 		case <-ticker.C:
-			s.statsLock.RLock()
-			totalBytes := s.totalBytes
-			s.statsLock.RUnlock()
-
-			s.logManager.Log("总发送流量: %.2f MB", bytesToMB(totalBytes))
+			u.stats.mu.Lock()
+			elapsed := time.Since(u.stats.startTime).Seconds()
+			if elapsed > 0 {
+				u.stats.bandwidthMbps = float64(u.stats.bytesSent*8) / (elapsed * 1000000)
+			}
 			
-			// 报告每个连接的统计
-			for i, connInfo := range s.connections {
-				s.statsLock.RLock()
-				bytesSent := connInfo.BytesSent
-				s.statsLock.RUnlock()
-				
-				status := "正常"
-				if connInfo.LastError != nil {
-					status = fmt.Sprintf("错误: %v", connInfo.LastError)
-				}
-				
-				s.logManager.Log("连接 %d (%s -> %s:%d): %.2f MB, 状态: %s, 重试次数: %d", 
-					i, connInfo.SourceIP, connInfo.TargetIP, connInfo.TargetPort, bytesToMB(bytesSent), status, connInfo.RetryCount)
-			}
+			// 格式化字节数显示
+			bytesStr := formatBytes(u.stats.bytesSent)
+			packetsStr := formatNumber(u.stats.packetsSent)
+			
+			u.logger.Infof("📊 统计信息 | 发送: %s (%s包) | 带宽: %.2f Mbps | 运行: %.1fs",
+				bytesStr, packetsStr, u.stats.bandwidthMbps, elapsed)
+			
+			u.stats.lastLogTime = time.Now()
+			u.stats.mu.Unlock()
 		}
 	}
 }
 
-// monitorConfig 监控配置文件变化
-func (s *UDPShooter) monitorConfig() {
-	ticker := time.NewTicker(time.Duration(s.config.ReloadInterval) * time.Second)
-	defer ticker.Stop()
+// formatBytes 格式化字节数显示
+// :param bytes: 字节数
+// :return: 格式化后的字符串
+func formatBytes(bytes int64) string {
+	const unit = 1024
+	if bytes < unit {
+		return fmt.Sprintf("%d B", bytes)
+	}
+	div, exp := int64(unit), 0
+	for n := bytes / unit; n >= unit; n /= unit {
+		div *= unit
+		exp++
+	}
+	return fmt.Sprintf("%.1f %cB", float64(bytes)/float64(div), "KMGTPE"[exp])
+}
 
-	for {
-		select {
-		case <-s.stopChan:
-			return
-		case <-ticker.C:
-			newConfig, err := loadConfig(s.config.ConfigFile)
-			if err != nil {
-				s.logManager.Log("重新加载配置失败: %v", err)
-				continue
-			}
+// formatNumber 格式化数字显示
+// :param num: 数字
+// :return: 格式化后的字符串
+func formatNumber(num int64) string {
+	if num < 1000 {
+		return fmt.Sprintf("%d", num)
+	}
+	if num < 1000000 {
+		return fmt.Sprintf("%.1fK", float64(num)/1000)
+	}
+	return fmt.Sprintf("%.1fM", float64(num)/1000000)
+}
 
-			s.configLock.Lock()
-			s.config = newConfig
-			s.configLock.Unlock()
+// Start 启动UDP打流器
+func (u *UDPShooter) Start() error {
+	// 分别解析IPv4和IPv6目标地址
+	var ipv4Targets []*net.UDPAddr
+	var ipv6Targets []*net.UDPAddr
+	
+	for _, target := range u.config.Targets {
+		// 处理IPv6地址格式
+		host := target.Host
+		if strings.Contains(host, ":") && !strings.Contains(host, "[") {
+			// IPv6地址需要加方括号
+			host = "[" + host + "]"
+		}
+		
+		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, target.Port))
+		if err != nil {
+			u.logger.Warnf("解析目标地址失败 %s:%d: %v", target.Host, target.Port, err)
+			continue
+		}
+		
+		// 根据IP类型分类
+		if addr.IP.To4() != nil {
+			ipv4Targets = append(ipv4Targets, addr)
+		} else {
+			ipv6Targets = append(ipv6Targets, addr)
+		}
+	}
 
-			s.logManager.Log("配置已重新加载")
+	// 分别处理源IP地址
+	var ipv4SourceIPs []string
+	var ipv6SourceIPs []string
+	
+	for _, sourceIP := range u.config.SourceIPs {
+		parsedIP := net.ParseIP(sourceIP)
+		if parsedIP == nil {
+			u.logger.Warnf("无效的源IP地址: %s", sourceIP)
+			continue
+		}
+		
+		if parsedIP.To4() != nil {
+			ipv4SourceIPs = append(ipv4SourceIPs, sourceIP)
+		} else {
+			ipv6SourceIPs = append(ipv6SourceIPs, sourceIP)
+		}
+	}
+
+	// 创建优化的数据包模板
+	packetTemplate := u.networkOptimizer.GetPacketTemplate(u.config.Packet.Size, u.config.Packet.PayloadPattern)
+
+	// 启动统计日志协程
+	u.wg.Add(1)
+	go u.logStats()
+
+	// 启动IPv4打流
+	if len(ipv4Targets) > 0 && len(ipv4SourceIPs) > 0 {
+		u.startIPv4Shooter(ipv4SourceIPs, ipv4Targets, packetTemplate)
+	}
+
+	// 启动IPv6打流
+	if len(ipv6Targets) > 0 && len(ipv6SourceIPs) > 0 {
+		u.startIPv6Shooter(ipv6SourceIPs, ipv6Targets, packetTemplate)
+	}
+
+	// 检查是否有有效的配置
+	totalTargets := len(ipv4Targets) + len(ipv6Targets)
+	totalSourceIPs := len(ipv4SourceIPs) + len(ipv6SourceIPs)
+	
+	if totalTargets == 0 {
+		return fmt.Errorf("没有有效的目标地址")
+	}
+	if totalSourceIPs == 0 {
+		return fmt.Errorf("没有有效的源IP地址")
+	}
+
+	u.logger.Infof("🚀 UDP打流器已启动 | IPv4目标: %d个 | IPv6目标: %d个 | IPv4源IP: %d个 | IPv6源IP: %d个",
+		len(ipv4Targets), len(ipv6Targets), len(ipv4SourceIPs), len(ipv6SourceIPs))
+
+	return nil
+}
+
+// startIPv4Shooter 启动IPv4打流器
+// :param sourceIPs: IPv4源IP列表
+// :param targetAddrs: IPv4目标地址列表
+// :param packetTemplate: 数据包模板
+func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 每个IP带宽: %d Mbps", 
+		len(targetAddrs), len(sourceIPs), bandwidthPerIP)
+
+	for _, sourceIP := range sourceIPs {
+		// 创建速率限制器
+		var rateLimiter *RateLimiter
+		if bandwidthPerIP > 0 {
+			rateLimiter = NewRateLimiter(bandwidthPerIP)
+		}
+
+		// 启动多个工作协程
+		for i := 0; i < u.config.Concurrency.WorkersPerIP; i++ {
+			u.wg.Add(1)
+			go u.sendPackets(sourceIP, targetAddrs, packetTemplate, rateLimiter)
 		}
 	}
 }
 
-// Stop 停止UDP打流
-func (s *UDPShooter) Stop() {
-	close(s.stopChan)
-	if s.logManager != nil {
-		s.logManager.Stop()
+// startIPv6Shooter 启动IPv6打流器
+// :param sourceIPs: IPv6源IP列表
+// :param targetAddrs: IPv6目标地址列表
+// :param packetTemplate: 数据包模板
+func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 每个IP带宽: %d Mbps", 
+		len(targetAddrs), len(sourceIPs), bandwidthPerIP)
+
+	for _, sourceIP := range sourceIPs {
+		// 创建速率限制器
+		var rateLimiter *RateLimiter
+		if bandwidthPerIP > 0 {
+			rateLimiter = NewRateLimiter(bandwidthPerIP)
+		}
+
+		// 启动多个工作协程
+		for i := 0; i < u.config.Concurrency.WorkersPerIP; i++ {
+			u.wg.Add(1)
+			go u.sendPackets(sourceIP, targetAddrs, packetTemplate, rateLimiter)
+		}
 	}
+}
+
+// Stop 停止UDP打流器
+func (u *UDPShooter) Stop() {
+	u.logger.Info("正在停止UDP打流器...")
+	u.cancel()
+	u.wg.Wait()
+	
+	// 输出最终统计信息
+	u.stats.mu.Lock()
+	elapsed := time.Since(u.stats.startTime).Seconds()
+	if elapsed > 0 {
+		u.stats.bandwidthMbps = float64(u.stats.bytesSent*8) / (elapsed * 1000000)
+	}
+	
+	// 格式化最终统计信息
+	bytesStr := formatBytes(u.stats.bytesSent)
+	packetsStr := formatNumber(u.stats.packetsSent)
+	
+	u.logger.Infof("🎯 最终统计 | 总发送: %s (%s包) | 平均带宽: %.2f Mbps | 总运行: %.1fs",
+		bytesStr, packetsStr, u.stats.bandwidthMbps, elapsed)
+	u.stats.mu.Unlock()
 }
 
 func main() {
-	// 打印启动banner和系统信息
+	// 设置CPU亲和性，最大化性能
+	runtime.GOMAXPROCS(runtime.NumCPU())
+	
+	// 设置GC参数，减少GC压力
+	debug.SetGCPercent(1000) // 增加GC触发阈值
+	debug.SetMemoryLimit(1 << 30) // 设置内存限制为1GB
+
+	// 加载配置
+	config, err := loadConfig("config.json")
+	if err != nil {
+		log.Fatalf("加载配置失败: %v", err)
+	}
+
+	// 打印启动banner
 	PrintBanner()
 	
-	configPath := "config.json"
-	if len(os.Args) > 1 {
-		configPath = os.Args[1]
+	// 设置日志
+	logger := setupLogger(config)
+	logger.Info("UDP打流器启动中...")
+
+	// 创建UDP打流器
+	shooter := NewUDPShooter(config, logger)
+
+	// 启动打流器
+	if err := shooter.Start(); err != nil {
+		logger.Fatalf("启动失败: %v", err)
 	}
 
-	shooter, err := NewUDPShooter(configPath)
-	if err != nil {
-		log.Fatalf("创建UDP打流器失败: %v", err)
-	}
-
-	// 处理信号
+	// 等待中断信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
+	
+	logger.Info("按 Ctrl+C 停止UDP打流器...")
+	<-sigChan
 
-	go func() {
-		<-sigChan
-		log.Println("收到停止信号")
-		shooter.Stop()
-	}()
-
-	if err := shooter.Start(); err != nil {
-		log.Fatalf("启动UDP打流失败: %v", err)
-	}
+	// 优雅停止
+	logger.Info("收到停止信号，正在优雅停止...")
+	shooter.Stop()
+	logger.Info("UDP打流器已停止")
 } 

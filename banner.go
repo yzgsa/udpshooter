@@ -24,7 +24,7 @@ func NewBannerInfo() *BannerInfo {
 	return &BannerInfo{
 		Version:   "0.3",
 		BuildDate: "2025-07-25",
-		Author:    "yuanzi",
+		Author:    "yuanz",
 		GoVersion: runtime.Version(),
 		OS:        runtime.GOOS,
 		Arch:      runtime.GOARCH,
