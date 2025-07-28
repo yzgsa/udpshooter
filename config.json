@@ -3,11 +3,14 @@
         {
             "host": "192.168.1.75",
             "port": 5888
+        },
+        {
+            "host": "192.168.1.52",
+            "port": 5888
         }
-        
     ],
     "bandwidth": {
-        "max_bandwidth_mbps": 800,
+        "max_bandwidth_mbps": 300,
         "max_bytes": 0
     },
     "source_ips": [
@@ -18,7 +21,7 @@
         "payload_pattern": "UDP_SHOOTER"
     },
     "concurrency": {
-        "workers_per_ip": 1,
+        "workers_per_ip": 10,
         "buffer_size": 131072
     },
     "logging": {

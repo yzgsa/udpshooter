@@ -220,8 +220,10 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 			batchWriter.WriteSingle(packet)
 
 			// 更新统计信息（原子操作）
+			// 实际发送的字节数 = 数据包大小 × 目标数量
+			actualBytesSent := int64(packetSize * len(connections))
 			u.stats.mu.Lock()
-			u.stats.bytesSent += int64(packetSize)
+			u.stats.bytesSent += actualBytesSent
 			u.stats.packetsSent++
 			u.stats.mu.Unlock()
 		}
@@ -371,9 +373,11 @@ func (u *UDPShooter) Start() error {
 // :param targetAddrs: IPv4目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 每个IP带宽: %d Mbps", 
-		len(targetAddrs), len(sourceIPs), bandwidthPerIP)
+	// 根据源IP数量和目标数量计算每个源IP的带宽限制
+	// 总带宽 / (源IP数量 × 目标数量) = 每个源IP-目标组合的带宽
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs) * len(targetAddrs))
+	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 单IP最大带宽: %d Mbps | 每个源IP-目标组合带宽: %d Mbps", 
+		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
 		// 创建速率限制器
@@ -395,8 +399,10 @@ func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDP
 // :param targetAddrs: IPv6目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 每个IP带宽: %d Mbps", 
+	// 根据源IP数量和目标数量计算每个源IP的带宽限制
+	// 总带宽 / (源IP数量 × 目标数量) = 每个源IP-目标组合的带宽
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs) * len(targetAddrs))
+	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 每个源IP-目标组合带宽: %d Mbps", 
 		len(targetAddrs), len(sourceIPs), bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
