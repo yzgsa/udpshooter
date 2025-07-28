@@ -1,28 +1,24 @@
 {
     "targets": [
         {
-            "host": "183.94.165.197",
+            "host": "192.168.1.75",
             "port": 5888
-        },
-        {
-            "host": "2408:864e:8000:105:1::20",
-            "port": 5889
         }
+        
     ],
     "bandwidth": {
-        "max_bandwidth_mbps": 15000,
+        "max_bandwidth_mbps": 800,
         "max_bytes": 0
     },
     "source_ips": [
-        "183.94.165.196",
-        "2408:864e:8000:105:1::40"
+        "192.168.1.31"
     ],
     "packet": {
         "size": 1400,
         "payload_pattern": "UDP_SHOOTER"
     },
     "concurrency": {
-        "workers_per_ip": 10,
+        "workers_per_ip": 1,
         "buffer_size": 131072
     },
     "logging": {

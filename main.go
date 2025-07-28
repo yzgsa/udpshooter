@@ -416,9 +416,8 @@ func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDP
 
 // Stop 停止UDP打流器
 func (u *UDPShooter) Stop() {
-	u.logger.Info("正在停止UDP打流器...")
+	u.logger.Info("正在强制停止UDP打流器...")
 	u.cancel()
-	u.wg.Wait()
 	
 	// 输出最终统计信息
 	u.stats.mu.Lock()
@@ -472,8 +471,8 @@ func main() {
 	logger.Info("按 Ctrl+C 停止UDP打流器...")
 	<-sigChan
 
-	// 优雅停止
-	logger.Info("收到停止信号，正在优雅停止...")
+	// 强制停止
+	logger.Info("收到停止信号，正在强制停止...")
 	shooter.Stop()
 	logger.Info("UDP打流器已停止")
 } 
