@@ -28,7 +28,7 @@ type Target struct {
 
 // Config 配置结构体
 type Config struct {
-	Targets []Target `json:"targets"`
+	Targets   []Target `json:"targets"`
 	Bandwidth struct {
 		MaxBandwidthMbps int64 `json:"max_bandwidth_mbps"`
 		MaxBytes         int64 `json:"max_bytes"`
@@ -68,11 +68,11 @@ type UDPShooter struct {
 
 // Stats 统计信息结构体
 type Stats struct {
-	mu           sync.RWMutex
-	bytesSent    int64
-	packetsSent  int64
-	startTime    time.Time
-	lastLogTime  time.Time
+	mu            sync.RWMutex
+	bytesSent     int64
+	packetsSent   int64
+	startTime     time.Time
+	lastLogTime   time.Time
 	bandwidthMbps float64
 }
 
@@ -116,7 +116,7 @@ func loadConfig(filename string) (*Config, error) {
 // :return: 日志记录器
 func setupLogger(config *Config) *logrus.Logger {
 	logger := logrus.New()
-	
+
 	// 设置日志级别
 	level, err := logrus.ParseLevel(config.Logging.Level)
 	if err != nil {
@@ -139,7 +139,7 @@ func setupLogger(config *Config) *logrus.Logger {
 		MaxAge:     config.Logging.MaxAgeDays,
 		Compress:   config.Logging.Compress,
 	}
-	
+
 	// 同时输出到文件和控制台
 	logger.SetOutput(io.MultiWriter(os.Stdout, fileWriter))
 
@@ -152,13 +152,13 @@ func setupLogger(config *Config) *logrus.Logger {
 // :return: 数据包字节数组
 func createPacket(size int, pattern string) []byte {
 	packet := make([]byte, size)
-	
+
 	// 填充模式字符串
 	patternBytes := []byte(pattern)
 	for i := 0; i < size; i++ {
 		packet[i] = patternBytes[i%len(patternBytes)]
 	}
-	
+
 	return packet
 }
 
@@ -178,12 +178,12 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 			u.logger.Errorf("创建UDP连接失败 [%s] -> %s: %v", sourceIP, targetAddr.String(), err)
 			continue
 		}
-		
+
 		// 设置发送缓冲区大小
 		if err := conn.SetWriteBuffer(u.config.Concurrency.BufferSize); err != nil {
 			u.logger.Warnf("设置发送缓冲区失败 [%s] -> %s: %v", sourceIP, targetAddr.String(), err)
 		}
-		
+
 		connections[i] = conn
 		defer conn.Close()
 	}
@@ -208,14 +208,16 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 		case <-u.ctx.Done():
 			return
 		default:
-			// 速率限制
+			// 速率限制 - 每次发送需要消费 packetSize * targetCount 的令牌
 			if rateLimiter != nil {
-				rateLimiter.Wait()
+				// 计算实际发送的总字节数（数据包大小 × 目标数量）
+				totalBytes := packetSize * len(connections)
+				rateLimiter.WaitBytes(totalBytes)
 			}
 
 			// 快速复制数据包模板
 			copy(packet, packetTemplate)
-			
+
 			// 批量发送到所有目标
 			batchWriter.WriteSingle(packet)
 
@@ -245,14 +247,14 @@ func (u *UDPShooter) logStats() {
 			if elapsed > 0 {
 				u.stats.bandwidthMbps = float64(u.stats.bytesSent*8) / (elapsed * 1000000)
 			}
-			
+
 			// 格式化字节数显示
 			bytesStr := formatBytes(u.stats.bytesSent)
 			packetsStr := formatNumber(u.stats.packetsSent)
-			
+
 			u.logger.Infof("📊 统计信息 | 发送: %s (%s包) | 带宽: %.2f Mbps | 运行: %.1fs",
 				bytesStr, packetsStr, u.stats.bandwidthMbps, elapsed)
-			
+
 			u.stats.lastLogTime = time.Now()
 			u.stats.mu.Unlock()
 		}
@@ -293,7 +295,7 @@ func (u *UDPShooter) Start() error {
 	// 分别解析IPv4和IPv6目标地址
 	var ipv4Targets []*net.UDPAddr
 	var ipv6Targets []*net.UDPAddr
-	
+
 	for _, target := range u.config.Targets {
 		// 处理IPv6地址格式
 		host := target.Host
@@ -301,13 +303,13 @@ func (u *UDPShooter) Start() error {
 			// IPv6地址需要加方括号
 			host = "[" + host + "]"
 		}
-		
+
 		addr, err := net.ResolveUDPAddr("udp", fmt.Sprintf("%s:%d", host, target.Port))
 		if err != nil {
 			u.logger.Warnf("解析目标地址失败 %s:%d: %v", target.Host, target.Port, err)
 			continue
 		}
-		
+
 		// 根据IP类型分类
 		if addr.IP.To4() != nil {
 			ipv4Targets = append(ipv4Targets, addr)
@@ -319,14 +321,14 @@ func (u *UDPShooter) Start() error {
 	// 分别处理源IP地址
 	var ipv4SourceIPs []string
 	var ipv6SourceIPs []string
-	
+
 	for _, sourceIP := range u.config.SourceIPs {
 		parsedIP := net.ParseIP(sourceIP)
 		if parsedIP == nil {
 			u.logger.Warnf("无效的源IP地址: %s", sourceIP)
 			continue
 		}
-		
+
 		if parsedIP.To4() != nil {
 			ipv4SourceIPs = append(ipv4SourceIPs, sourceIP)
 		} else {
@@ -354,7 +356,7 @@ func (u *UDPShooter) Start() error {
 	// 检查是否有有效的配置
 	totalTargets := len(ipv4Targets) + len(ipv6Targets)
 	totalSourceIPs := len(ipv4SourceIPs) + len(ipv6SourceIPs)
-	
+
 	if totalTargets == 0 {
 		return fmt.Errorf("没有有效的目标地址")
 	}
@@ -373,20 +375,19 @@ func (u *UDPShooter) Start() error {
 // :param targetAddrs: IPv4目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 根据源IP数量和目标数量计算每个源IP的带宽限制
-	// 总带宽 / (源IP数量 × 目标数量) = 每个源IP-目标组合的带宽
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs) * len(targetAddrs))
-	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 单IP最大带宽: %d Mbps | 每个源IP-目标组合带宽: %d Mbps", 
+	// 修复：每个源IP应该分配 总带宽 / 源IP数量
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
 		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
-		// 创建速率限制器
+		// 创建速率限制器，限制该IP的总流量
 		var rateLimiter *RateLimiter
 		if bandwidthPerIP > 0 {
-			rateLimiter = NewRateLimiter(bandwidthPerIP)
+			rateLimiter = NewRateLimiter(bandwidthPerIP, len(packetTemplate))
 		}
 
-		// 启动多个工作协程
+		// 启动多个工作协程，共享同一个速率限制器
 		for i := 0; i < u.config.Concurrency.WorkersPerIP; i++ {
 			u.wg.Add(1)
 			go u.sendPackets(sourceIP, targetAddrs, packetTemplate, rateLimiter)
@@ -399,20 +400,19 @@ func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDP
 // :param targetAddrs: IPv6目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 根据源IP数量和目标数量计算每个源IP的带宽限制
-	// 总带宽 / (源IP数量 × 目标数量) = 每个源IP-目标组合的带宽
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs) * len(targetAddrs))
-	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 每个源IP-目标组合带宽: %d Mbps", 
-		len(targetAddrs), len(sourceIPs), bandwidthPerIP)
+	// 修复：每个源IP应该分配 总带宽 / 源IP数量
+	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
+		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
-		// 创建速率限制器
+		// 创建速率限制器，限制该IP的总流量
 		var rateLimiter *RateLimiter
 		if bandwidthPerIP > 0 {
-			rateLimiter = NewRateLimiter(bandwidthPerIP)
+			rateLimiter = NewRateLimiter(bandwidthPerIP, len(packetTemplate))
 		}
 
-		// 启动多个工作协程
+		// 启动多个工作协程，共享同一个速率限制器
 		for i := 0; i < u.config.Concurrency.WorkersPerIP; i++ {
 			u.wg.Add(1)
 			go u.sendPackets(sourceIP, targetAddrs, packetTemplate, rateLimiter)
@@ -424,18 +424,18 @@ func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDP
 func (u *UDPShooter) Stop() {
 	u.logger.Info("正在强制停止UDP打流器...")
 	u.cancel()
-	
+
 	// 输出最终统计信息
 	u.stats.mu.Lock()
 	elapsed := time.Since(u.stats.startTime).Seconds()
 	if elapsed > 0 {
 		u.stats.bandwidthMbps = float64(u.stats.bytesSent*8) / (elapsed * 1000000)
 	}
-	
+
 	// 格式化最终统计信息
 	bytesStr := formatBytes(u.stats.bytesSent)
 	packetsStr := formatNumber(u.stats.packetsSent)
-	
+
 	u.logger.Infof("🎯 最终统计 | 总发送: %s (%s包) | 平均带宽: %.2f Mbps | 总运行: %.1fs",
 		bytesStr, packetsStr, u.stats.bandwidthMbps, elapsed)
 	u.stats.mu.Unlock()
@@ -444,9 +444,9 @@ func (u *UDPShooter) Stop() {
 func main() {
 	// 设置CPU亲和性，最大化性能
 	runtime.GOMAXPROCS(runtime.NumCPU())
-	
+
 	// 设置GC参数，减少GC压力
-	debug.SetGCPercent(1000) // 增加GC触发阈值
+	debug.SetGCPercent(1000)      // 增加GC触发阈值
 	debug.SetMemoryLimit(1 << 30) // 设置内存限制为1GB
 
 	// 加载配置
@@ -457,7 +457,7 @@ func main() {
 
 	// 打印启动banner
 	PrintBanner()
-	
+
 	// 设置日志
 	logger := setupLogger(config)
 	logger.Info("UDP打流器启动中...")
@@ -473,7 +473,7 @@ func main() {
 	// 等待中断信号
 	sigChan := make(chan os.Signal, 1)
 	signal.Notify(sigChan, syscall.SIGINT, syscall.SIGTERM)
-	
+
 	logger.Info("按 Ctrl+C 停止UDP打流器...")
 	<-sigChan
 
@@ -481,4 +481,4 @@ func main() {
 	logger.Info("收到停止信号，正在强制停止...")
 	shooter.Stop()
 	logger.Info("UDP打流器已停止")
-} 
+}
