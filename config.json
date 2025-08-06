@@ -40,7 +40,7 @@
     "schedules": [
         {
             "id": "schedule1",
-            "start_time": "22:13:37",
+            "start_time": "12:13:37",
             "end_time": "22:23:37",
             "repeat": "daily"
         },
