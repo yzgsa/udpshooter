@@ -97,6 +97,10 @@ func (s *Scheduler) Start() {
 		return
 	}
 	
+	// 立即检查是否有正在进行的调度任务
+	now := time.Now()
+	s.checkCurrentSchedules(now)
+	
 	s.wg.Add(1)
 	go s.scheduleLoop()
 	s.logger.Infof("⏰ 调度器已启动，共 %d 个任务", len(s.schedules))
@@ -130,7 +134,64 @@ func (s *Scheduler) scheduleLoop() {
 	}
 }
 
-// checkSchedules 检查调度任务
+// checkCurrentSchedules 检查当前时间是否在调度区间内
+func (s *Scheduler) checkCurrentSchedules(now time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	
+	for _, item := range s.schedules {
+		if item.State != ScheduleWaiting {
+			continue
+		}
+		
+		// 检查当前时间是否在今天的调度区间内
+		if s.isInScheduleWindow(item.Schedule, now) {
+			s.logger.Infof("🔍 发现当前时间处于调度区间内: [%s] %s - %s", 
+				item.Schedule.ID, item.Schedule.StartTime, item.Schedule.EndTime)
+			s.startScheduleItem(item, now)
+		}
+	}
+}
+
+// isInScheduleWindow 检查当前时间是否在调度窗口内
+func (s *Scheduler) isInScheduleWindow(schedule Schedule, now time.Time) bool {
+	// 解析今天的开始和结束时间
+	startTime, err := s.parseTimeOfDay(schedule.StartTime, now)
+	if err != nil {
+		return false
+	}
+	
+	endTime, err := s.parseTimeOfDay(schedule.EndTime, now)
+	if err != nil {
+		return false
+	}
+	
+	// 检查重复模式是否匹配今天
+	if !s.isScheduleActiveToday(schedule, now) {
+		return false
+	}
+	
+	// 检查当前时间是否在区间内
+	return (now.After(startTime) || now.Equal(startTime)) && now.Before(endTime)
+}
+
+// isScheduleActiveToday 检查调度是否在今天生效
+func (s *Scheduler) isScheduleActiveToday(schedule Schedule, now time.Time) bool {
+	switch schedule.Repeat {
+	case "once":
+		// 单次执行，检查是否是设置的那一天（这里简化处理，假设都是今天）
+		return true
+	case "daily":
+		// 每天执行
+		return true
+	case "weekdays":
+		// 工作日执行（周一到周五）
+		weekday := now.Weekday()
+		return weekday >= time.Monday && weekday <= time.Friday
+	default:
+		return false
+	}
+}
 func (s *Scheduler) checkSchedules(now time.Time) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -203,6 +264,11 @@ func (s *Scheduler) calculateNextRun(schedule Schedule, baseTime time.Time) (tim
 		return time.Time{}, err
 	}
 	
+	// 如果当前时间在今天的调度区间内，不需要计算下次运行时间
+	if s.isInScheduleWindow(schedule, baseTime) {
+		return startTime, nil
+	}
+	
 	// 如果今天的时间已经过了，计算明天或下个工作日
 	if startTime.Before(baseTime) || startTime.Equal(baseTime) {
 		switch schedule.Repeat {
@@ -215,6 +281,17 @@ func (s *Scheduler) calculateNextRun(schedule Schedule, baseTime time.Time) (tim
 		case "weekdays":
 			// 工作日执行，找下一个工作日
 			startTime = s.nextWeekday(startTime)
+		}
+	} else {
+		// 今天的时间还没到，检查是否符合重复模式
+		if !s.isScheduleActiveToday(schedule, baseTime) {
+			// 今天不符合重复模式，找下一个符合的日期
+			switch schedule.Repeat {
+			case "daily":
+				startTime = startTime.AddDate(0, 0, 1)
+			case "weekdays":
+				startTime = s.nextWeekday(startTime)
+			}
 		}
 	}
 	
