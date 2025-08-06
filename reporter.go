@@ -4,29 +4,27 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"fmt"
+	"github.com/sirupsen/logrus"
 	"net/http"
 	"runtime"
 	"sync"
 	"time"
-
-	"github.com/sirupsen/logrus"
 )
 
 // SystemStats 系统资源统计信息
 type SystemStats struct {
-	CPUCount      int     `json:"cpu_count"`
-	MemoryUsageMB float64 `json:"memory_usage_mb"`
-	MemoryTotalMB float64 `json:"memory_total_mb"`
-	GoroutineCount int    `json:"goroutine_count"`
-	GCCount       uint32  `json:"gc_count"`
-	GCPauseMs     float64 `json:"gc_pause_ms"`
+	CPUCount       int     `json:"cpu_count"`
+	MemoryUsageMB  float64 `json:"memory_usage_mb"`
+	MemoryTotalMB  float64 `json:"memory_total_mb"`
+	GoroutineCount int     `json:"goroutine_count"`
+	GCCount        uint32  `json:"gc_count"`
+	GCPauseMs      float64 `json:"gc_pause_ms"`
 }
 
 // ReportData 上报数据结构
 type ReportData struct {
-	Timestamp     time.Time                  `json:"timestamp"`
-	TotalStats    struct {
+	Timestamp  time.Time `json:"timestamp"`
+	TotalStats struct {
 		BytesSent     int64   `json:"bytes_sent"`
 		PacketsSent   int64   `json:"packets_sent"`
 		BandwidthMbps float64 `json:"bandwidth_mbps"`
@@ -46,7 +44,7 @@ type Reporter struct {
 	cancel     context.CancelFunc
 	wg         sync.WaitGroup
 	startTime  time.Time
-	reportURL  string    // 完整的上报URL
+	reportURL  string // 完整的上报URL
 	httpClient *http.Client
 }
 
@@ -57,18 +55,18 @@ type Reporter struct {
 // :return: 监控上报器实例
 func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
 	ctx, cancel := context.WithCancel(context.Background())
-	
+
 	// 设置默认间隔为10分钟
 	interval := time.Duration(config.Interval) * time.Second
 	if interval <= 0 {
 		interval = 10 * time.Minute
 	}
-	
+
 	// 创建HTTP客户端，设置超时时间
 	httpClient := &http.Client{
 		Timeout: 30 * time.Second,
 	}
-	
+
 	return &Reporter{
 		interval:   interval,
 		stats:      stats,
@@ -85,7 +83,7 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
 func (r *Reporter) Start() {
 	r.wg.Add(1)
 	go r.reportLoop()
-	
+
 	if r.reportURL != "" {
 		r.logger.Infof("📊 监控上报器已启动，间隔: %v，URL: %s", r.interval, r.reportURL)
 	} else {
@@ -103,10 +101,10 @@ func (r *Reporter) Stop() {
 // reportLoop 上报循环
 func (r *Reporter) reportLoop() {
 	defer r.wg.Done()
-	
+
 	ticker := time.NewTicker(r.interval)
 	defer ticker.Stop()
-	
+
 	for {
 		select {
 		case <-r.ctx.Done():
@@ -121,19 +119,19 @@ func (r *Reporter) reportLoop() {
 func (r *Reporter) generateReport() {
 	r.stats.mu.RLock()
 	defer r.stats.mu.RUnlock()
-	
+
 	// 计算运行时间
 	uptime := time.Since(r.startTime).Seconds()
-	
+
 	// 计算整体带宽
 	var totalBandwidth float64
 	if uptime > 0 {
 		totalBandwidth = float64(r.stats.bytesSent*8) / (uptime * 1000000)
 	}
-	
+
 	// 收集系统资源信息
 	systemStats := r.collectSystemStats()
-	
+
 	// 更新每个源IP的带宽统计
 	sourceIPStats := make(map[string]*SourceStats)
 	for ip, stats := range r.stats.sourceIPStats {
@@ -142,7 +140,7 @@ func (r *Reporter) generateReport() {
 		if uptime > 0 && stats.BytesSent > 0 {
 			ipBandwidth = float64(stats.BytesSent*8) / (uptime * 1000000)
 		}
-		
+
 		sourceIPStats[ip] = &SourceStats{
 			BytesSent:     stats.BytesSent,
 			PacketsSent:   stats.PacketsSent,
@@ -150,7 +148,7 @@ func (r *Reporter) generateReport() {
 			LastActive:    stats.LastActive,
 		}
 	}
-	
+
 	// 创建上报数据
 	reportData := ReportData{
 		Timestamp: time.Now(),
@@ -169,19 +167,19 @@ func (r *Reporter) generateReport() {
 		TargetStats:   r.stats.targetStats,
 		SystemStats:   systemStats,
 	}
-	
+
 	// 转换为JSON格式
 	jsonData, err := json.MarshalIndent(reportData, "", "  ")
 	if err != nil {
 		r.logger.Errorf("生成监控报告失败: %v", err)
 		return
 	}
-	
+
 	// 发送到远程监控系统
 	if r.reportURL != "" {
 		r.sendToRemote(jsonData)
 	}
-	
+
 	// 输出监控报告
 	r.logger.Infof("📈 监控报告:")
 	r.logger.Infof("总发送: %s (%s包) | 带宽: %.2f Mbps | 运行: %.1fs",
@@ -189,7 +187,7 @@ func (r *Reporter) generateReport() {
 		formatNumber(reportData.TotalStats.PacketsSent),
 		reportData.TotalStats.BandwidthMbps,
 		reportData.TotalStats.UptimeSeconds)
-	
+
 	// 输出源IP统计
 	for ip, stats := range sourceIPStats {
 		r.logger.Infof("源IP [%s]: %s | %.2f Mbps | %s包",
@@ -198,7 +196,7 @@ func (r *Reporter) generateReport() {
 			stats.BandwidthMbps,
 			formatNumber(stats.PacketsSent))
 	}
-	
+
 	// 输出系统资源统计
 	r.logger.Infof("系统资源: CPU核心: %d | 内存: %.1f/%.1f MB | 协程: %d | GC: %d次",
 		systemStats.CPUCount,
@@ -206,7 +204,7 @@ func (r *Reporter) generateReport() {
 		systemStats.MemoryTotalMB,
 		systemStats.GoroutineCount,
 		systemStats.GCCount)
-	
+
 	// 可以在这里添加发送到远程监控系统的逻辑
 	// 例如: r.sendToRemote(jsonData)
 }
@@ -215,7 +213,7 @@ func (r *Reporter) generateReport() {
 func (r *Reporter) collectSystemStats() SystemStats {
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
-	
+
 	return SystemStats{
 		CPUCount:       runtime.NumCPU(),
 		MemoryUsageMB:  float64(memStats.Alloc) / 1024 / 1024,
@@ -234,11 +232,11 @@ func (r *Reporter) sendToRemote(data []byte) {
 		r.logger.Errorf("创建HTTP请求失败: %v", err)
 		return
 	}
-	
+
 	// 设置请求头
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "UDP-Shooter/1.0")
-	
+
 	// 发送请求
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
@@ -246,7 +244,7 @@ func (r *Reporter) sendToRemote(data []byte) {
 		return
 	}
 	defer resp.Body.Close()
-	
+
 	// 检查响应状态
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
 		r.logger.Debugf("监控数据发送成功: %s (状态码: %d)", r.reportURL, resp.StatusCode)
