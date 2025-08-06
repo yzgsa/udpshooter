@@ -42,9 +42,10 @@ type Report struct {
 
 // Config 配置结构体
 type Config struct {
-	ConfigMode  string     `json:"config_mode,omitempty"` // "local" 或 "remote"
-	Targets     []Target   `json:"targets"`
-	Bandwidth   struct {
+	ConfigMode   string     `json:"config_mode,omitempty"` // "local" 或 "remote"
+	ManagementIP string     `json:"management_ip"`         // 本地管理IP，作为本机标识
+	Targets      []Target   `json:"targets"`
+	Bandwidth    struct {
 		MaxBandwidthMbps int64 `json:"max_bandwidth_mbps"`
 		MaxBytes         int64 `json:"max_bytes"`
 	} `json:"bandwidth"`
@@ -159,7 +160,7 @@ func NewUDPShooter(config *Config, logger *logrus.Logger) *UDPShooter {
 	shooter.scheduler = NewScheduler(config.Schedules, logger)
 	
 	// 初始化上报器
-	shooter.reporter = NewReporter(config.Report, stats, logger)
+	shooter.reporter = NewReporter(config.Report, stats, logger, config.ManagementIP)
 	
 	return shooter
 }

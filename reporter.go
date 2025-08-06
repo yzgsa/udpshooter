@@ -13,18 +13,15 @@ import (
 
 // SystemStats 系统资源统计信息
 type SystemStats struct {
-	CPUCount       int     `json:"cpu_count"`
-	MemoryUsageMB  float64 `json:"memory_usage_mb"`
-	MemoryTotalMB  float64 `json:"memory_total_mb"`
-	GoroutineCount int     `json:"goroutine_count"`
-	GCCount        uint32  `json:"gc_count"`
-	GCPauseMs      float64 `json:"gc_pause_ms"`
+	CPUUsage       float64 `json:"cpu_usage"`        // CPU使用率百分比
+	MemoryUsage    float64 `json:"memory_usage"`     // 内存使用率百分比
 }
 
 // ReportData 上报数据结构
 type ReportData struct {
-	Timestamp  time.Time `json:"timestamp"`
-	TotalStats struct {
+	Timestamp    time.Time `json:"timestamp"`
+	ManagementIP string    `json:"management_ip"` // 本机管理IP标识
+	TotalStats   struct {
 		BytesSent     int64   `json:"bytes_sent"`
 		PacketsSent   int64   `json:"packets_sent"`
 		BandwidthMbps float64 `json:"bandwidth_mbps"`
@@ -37,23 +34,26 @@ type ReportData struct {
 
 // Reporter 监控上报器
 type Reporter struct {
-	interval   time.Duration
-	stats      *Stats
-	logger     *logrus.Logger
-	ctx        context.Context
-	cancel     context.CancelFunc
-	wg         sync.WaitGroup
-	startTime  time.Time
-	reportURL  string // 完整的上报URL
-	httpClient *http.Client
+	interval     time.Duration
+	stats        *Stats
+	logger       *logrus.Logger
+	ctx          context.Context
+	cancel       context.CancelFunc
+	wg           sync.WaitGroup
+	startTime    time.Time
+	reportURL    string      // 完整的上报URL
+	httpClient   *http.Client
+	managementIP string      // 管理IP
+	cpuMonitor   *CPUMonitor // CPU监控器
 }
 
 // NewReporter 创建新的监控上报器
 // :param config: 上报配置
 // :param stats: 统计信息
 // :param logger: 日志记录器
+// :param managementIP: 管理IP
 // :return: 监控上报器实例
-func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
+func NewReporter(config Report, stats *Stats, logger *logrus.Logger, managementIP string) *Reporter {
 	ctx, cancel := context.WithCancel(context.Background())
 
 	// 设置默认间隔为10分钟
@@ -67,32 +67,43 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
 		Timeout: 30 * time.Second,
 	}
 
+	// 创建CPU监控器
+	cpuMonitor := NewCPUMonitor()
+
 	return &Reporter{
-		interval:   interval,
-		stats:      stats,
-		logger:     logger,
-		ctx:        ctx,
-		cancel:     cancel,
-		startTime:  time.Now(),
-		reportURL:  config.URL,
-		httpClient: httpClient,
+		interval:     interval,
+		stats:        stats,
+		logger:       logger,
+		ctx:          ctx,
+		cancel:       cancel,
+		startTime:    time.Now(),
+		reportURL:    config.URL,
+		httpClient:   httpClient,
+		managementIP: managementIP,
+		cpuMonitor:   cpuMonitor,
 	}
 }
 
 // Start 启动监控上报
 func (r *Reporter) Start() {
+	// 启动CPU监控
+	r.cpuMonitor.Start()
+	
 	r.wg.Add(1)
 	go r.reportLoop()
 
 	if r.reportURL != "" {
-		r.logger.Infof("📊 监控上报器已启动，间隔: %v，URL: %s", r.interval, r.reportURL)
+		r.logger.Infof("📊 监控上报器已启动，间隔: %v，URL: %s，管理IP: %s", r.interval, r.reportURL, r.managementIP)
 	} else {
-		r.logger.Infof("📊 监控上报器已启动，间隔: %v（仅本地日志）", r.interval)
+		r.logger.Infof("📊 监控上报器已启动，间隔: %v（仅本地日志），管理IP: %s", r.interval, r.managementIP)
 	}
 }
 
 // Stop 停止监控上报
 func (r *Reporter) Stop() {
+	// 停止CPU监控
+	r.cpuMonitor.Stop()
+	
 	r.cancel()
 	r.wg.Wait()
 	r.logger.Info("📊 监控上报器已停止")
@@ -151,7 +162,8 @@ func (r *Reporter) generateReport() {
 
 	// 创建上报数据
 	reportData := ReportData{
-		Timestamp: time.Now(),
+		Timestamp:    time.Now(),
+		ManagementIP: r.managementIP,
 		TotalStats: struct {
 			BytesSent     int64   `json:"bytes_sent"`
 			PacketsSent   int64   `json:"packets_sent"`
@@ -198,12 +210,9 @@ func (r *Reporter) generateReport() {
 	}
 
 	// 输出系统资源统计
-	r.logger.Infof("系统资源: CPU核心: %d | 内存: %.1f/%.1f MB | 协程: %d | GC: %d次",
-		systemStats.CPUCount,
-		systemStats.MemoryUsageMB,
-		systemStats.MemoryTotalMB,
-		systemStats.GoroutineCount,
-		systemStats.GCCount)
+	r.logger.Infof("系统资源: CPU: %.1f%% | 内存: %.1f%%",
+		systemStats.CPUUsage,
+		systemStats.MemoryUsage)
 
 	// 可以在这里添加发送到远程监控系统的逻辑
 	// 例如: r.sendToRemote(jsonData)
@@ -211,16 +220,9 @@ func (r *Reporter) generateReport() {
 
 // collectSystemStats 收集系统资源统计信息
 func (r *Reporter) collectSystemStats() SystemStats {
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-
 	return SystemStats{
-		CPUCount:       runtime.NumCPU(),
-		MemoryUsageMB:  float64(memStats.Alloc) / 1024 / 1024,
-		MemoryTotalMB:  float64(memStats.Sys) / 1024 / 1024,
-		GoroutineCount: runtime.NumGoroutine(),
-		GCCount:        memStats.NumGC,
-		GCPauseMs:      float64(memStats.PauseNs[memStats.NumGC%256]) / 1000000,
+		CPUUsage:    r.cpuMonitor.GetCPUUsage(),
+		MemoryUsage: r.cpuMonitor.GetMemoryUsage(),
 	}
 }
 

@@ -1,5 +1,6 @@
 {
     "config_mode": "local",
+    "management_ip": "192.168.1.31",
     "targets": [
         {
             "host": "192.168.1.75",
