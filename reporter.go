@@ -4,17 +4,20 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"github.com/sirupsen/logrus"
 	"net/http"
-	"runtime"
+	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
+
+	"github.com/sirupsen/logrus"
 )
 
 // SystemStats 系统资源统计信息
 type SystemStats struct {
-	CPUUsage       float64 `json:"cpu_usage"`        // CPU使用率百分比
-	MemoryUsage    float64 `json:"memory_usage"`     // 内存使用率百分比
+	CPUUsage    float64 `json:"cpu_usage"`    // CPU使用率百分比
+	MemoryUsage float64 `json:"memory_usage"` // 内存使用率百分比
 }
 
 // ReportData 上报数据结构
@@ -41,10 +44,9 @@ type Reporter struct {
 	cancel       context.CancelFunc
 	wg           sync.WaitGroup
 	startTime    time.Time
-	reportURL    string      // 完整的上报URL
+	reportURL    string // 完整的上报URL
 	httpClient   *http.Client
-	managementIP string      // 管理IP
-	cpuMonitor   *CPUMonitor // CPU监控器
+	managementIP string // 管理IP
 }
 
 // NewReporter 创建新的监控上报器
@@ -67,9 +69,6 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger, managementI
 		Timeout: 30 * time.Second,
 	}
 
-	// 创建CPU监控器
-	cpuMonitor := NewCPUMonitor()
-
 	return &Reporter{
 		interval:     interval,
 		stats:        stats,
@@ -80,15 +79,11 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger, managementI
 		reportURL:    config.URL,
 		httpClient:   httpClient,
 		managementIP: managementIP,
-		cpuMonitor:   cpuMonitor,
 	}
 }
 
 // Start 启动监控上报
 func (r *Reporter) Start() {
-	// 启动CPU监控
-	r.cpuMonitor.Start()
-	
 	r.wg.Add(1)
 	go r.reportLoop()
 
@@ -101,9 +96,6 @@ func (r *Reporter) Start() {
 
 // Stop 停止监控上报
 func (r *Reporter) Stop() {
-	// 停止CPU监控
-	r.cpuMonitor.Stop()
-	
 	r.cancel()
 	r.wg.Wait()
 	r.logger.Info("📊 监控上报器已停止")
@@ -221,9 +213,49 @@ func (r *Reporter) generateReport() {
 // collectSystemStats 收集系统资源统计信息
 func (r *Reporter) collectSystemStats() SystemStats {
 	return SystemStats{
-		CPUUsage:    r.cpuMonitor.GetCPUUsage(),
-		MemoryUsage: r.cpuMonitor.GetMemoryUsage(),
+		CPUUsage:    r.getCPUUsage(),
+		MemoryUsage: r.getMemoryUsage(),
 	}
+}
+
+// getCPUUsage 获取CPU使用率
+func (r *Reporter) getCPUUsage() float64 {
+	// 使用top命令获取CPU使用率
+	cmd := exec.Command("sh", "-c", "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | sed 's/%us,//'")
+	output, err := cmd.Output()
+	if err != nil {
+		r.logger.Debugf("获取CPU使用率失败: %v", err)
+		return 0.0
+	}
+
+	cpuStr := strings.TrimSpace(string(output))
+	cpuUsage, err := strconv.ParseFloat(cpuStr, 64)
+	if err != nil {
+		r.logger.Debugf("解析CPU使用率失败: %v", err)
+		return 0.0
+	}
+
+	return cpuUsage
+}
+
+// getMemoryUsage 获取内存使用率
+func (r *Reporter) getMemoryUsage() float64 {
+	// 使用free命令获取内存使用率
+	cmd := exec.Command("sh", "-c", "free | grep Mem | awk '{printf \"%.1f\", $3/$2 * 100.0}'")
+	output, err := cmd.Output()
+	if err != nil {
+		r.logger.Debugf("获取内存使用率失败: %v", err)
+		return 0.0
+	}
+
+	memStr := strings.TrimSpace(string(output))
+	memUsage, err := strconv.ParseFloat(memStr, 64)
+	if err != nil {
+		r.logger.Debugf("解析内存使用率失败: %v", err)
+		return 0.0
+	}
+
+	return memUsage
 }
 
 // sendToRemote 发送数据到远程监控系统
