@@ -1,8 +1,11 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"net/http"
 	"runtime"
 	"sync"
 	"time"
@@ -36,13 +39,15 @@ type ReportData struct {
 
 // Reporter 监控上报器
 type Reporter struct {
-	interval  time.Duration
-	stats     *Stats
-	logger    *logrus.Logger
-	ctx       context.Context
-	cancel    context.CancelFunc
-	wg        sync.WaitGroup
-	startTime time.Time
+	interval   time.Duration
+	stats      *Stats
+	logger     *logrus.Logger
+	ctx        context.Context
+	cancel     context.CancelFunc
+	wg         sync.WaitGroup
+	startTime  time.Time
+	reportURL  string    // 完整的上报URL
+	httpClient *http.Client
 }
 
 // NewReporter 创建新的监控上报器
@@ -59,13 +64,20 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
 		interval = 10 * time.Minute
 	}
 	
+	// 创建HTTP客户端，设置超时时间
+	httpClient := &http.Client{
+		Timeout: 30 * time.Second,
+	}
+	
 	return &Reporter{
-		interval:  interval,
-		stats:     stats,
-		logger:    logger,
-		ctx:       ctx,
-		cancel:    cancel,
-		startTime: time.Now(),
+		interval:   interval,
+		stats:      stats,
+		logger:     logger,
+		ctx:        ctx,
+		cancel:     cancel,
+		startTime:  time.Now(),
+		reportURL:  config.URL,
+		httpClient: httpClient,
 	}
 }
 
@@ -73,7 +85,12 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger) *Reporter {
 func (r *Reporter) Start() {
 	r.wg.Add(1)
 	go r.reportLoop()
-	r.logger.Infof("📊 监控上报器已启动，间隔: %v", r.interval)
+	
+	if r.reportURL != "" {
+		r.logger.Infof("📊 监控上报器已启动，间隔: %v，URL: %s", r.interval, r.reportURL)
+	} else {
+		r.logger.Infof("📊 监控上报器已启动，间隔: %v（仅本地日志）", r.interval)
+	}
 }
 
 // Stop 停止监控上报
@@ -160,9 +177,10 @@ func (r *Reporter) generateReport() {
 		return
 	}
 	
-	// 可以在这里添加发送到远程监控系统的逻辑
-	// 例如: r.sendToRemote(jsonData)
-	_ = jsonData // 暂时忽略未使用的变量
+	// 发送到远程监控系统
+	if r.reportURL != "" {
+		r.sendToRemote(jsonData)
+	}
 	
 	// 输出监控报告
 	r.logger.Infof("📈 监控报告:")
@@ -208,9 +226,31 @@ func (r *Reporter) collectSystemStats() SystemStats {
 	}
 }
 
-// sendToRemote 发送数据到远程监控系统（可选实现）
+// sendToRemote 发送数据到远程监控系统
 func (r *Reporter) sendToRemote(data []byte) {
-	// 这里可以实现发送到远程监控系统的逻辑
-	// 例如通过HTTP POST或其他协议发送数据
-	r.logger.Debug("发送监控数据到远程系统")
+	// 创建HTTP请求
+	req, err := http.NewRequestWithContext(r.ctx, "POST", r.reportURL, bytes.NewBuffer(data))
+	if err != nil {
+		r.logger.Errorf("创建HTTP请求失败: %v", err)
+		return
+	}
+	
+	// 设置请求头
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("User-Agent", "UDP-Shooter/1.0")
+	
+	// 发送请求
+	resp, err := r.httpClient.Do(req)
+	if err != nil {
+		r.logger.Errorf("发送监控数据失败: %v", err)
+		return
+	}
+	defer resp.Body.Close()
+	
+	// 检查响应状态
+	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+		r.logger.Debugf("监控数据发送成功: %s (状态码: %d)", r.reportURL, resp.StatusCode)
+	} else {
+		r.logger.Warnf("监控数据发送异常: %s (状态码: %d)", r.reportURL, resp.StatusCode)
+	}
 }

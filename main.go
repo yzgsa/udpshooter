@@ -36,7 +36,8 @@ type Schedule struct {
 
 // Report 上报配置结构体
 type Report struct {
-	Interval int `json:"interval"` // 上报间隔，单位秒，默认600秒(10分钟)
+	Interval int    `json:"interval"` // 上报间隔，单位秒，默认600秒(10分钟)
+	URL      string `json:"url"`      // 完整的上报URL，例如: "http://localhost:8080/api/udpshooter/monitor/"
 }
 
 // Config 配置结构体
