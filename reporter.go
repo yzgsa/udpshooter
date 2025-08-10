@@ -59,6 +59,10 @@ type Reporter struct {
 	lastCPUTime   time.Time
 	lastCPUStats  SystemStats
 	cpuCacheMutex sync.RWMutex
+	
+	// CPU差值计算（用于瞬时使用率）
+	lastCPUValues []float64 // 保存上次读取的CPU累积值
+	lastCPUTime2  time.Time   // CPU差值计算的时间戳
 }
 
 // NewReporter 创建新的监控上报器
@@ -267,7 +271,7 @@ func (r *Reporter) collectSystemStats() SystemStats {
 	return stats
 }
 
-// getSystemCPUUsage 获取Linux系统整体CPU使用率
+// getSystemCPUUsage 获取Linux系统整体CPU使用率（基于差值计算）
 func (r *Reporter) getSystemCPUUsage() float64 {
 	// 读取/proc/stat获取CPU时间
 	data, err := os.ReadFile("/proc/stat")
@@ -287,30 +291,48 @@ func (r *Reporter) getSystemCPUUsage() float64 {
 		return 0.0
 	}
 	
-	user, _ := strconv.ParseFloat(fields[1], 64)     // 用户态时间
-	nice, _ := strconv.ParseFloat(fields[2], 64)     // 低优先级用户态时间
-	system, _ := strconv.ParseFloat(fields[3], 64)   // 内核态时间
-	idle, _ := strconv.ParseFloat(fields[4], 64)     // 空闲时间
-	iowait, _ := strconv.ParseFloat(fields[5], 64)   // IO等待时间（CPU空闲）
-	irq, _ := strconv.ParseFloat(fields[6], 64)      // 硬中断时间
-	softirq, _ := strconv.ParseFloat(fields[7], 64)  // 软中断时间（重要！）
+	// 解析当前的CPU累积值
+	currentValues := make([]float64, 10)
+	for i := 1; i <= 9 && i < len(fields); i++ {
+		currentValues[i-1], _ = strconv.ParseFloat(fields[i], 64)
+	}
 	
-	// 可选字段
-	steal := 0.0
-	if len(fields) > 8 {
-		steal, _ = strconv.ParseFloat(fields[8], 64)  // 虚拟化偷取时间
+	now := time.Now()
+	
+	// 如果是第一次读取，保存数据并返回0
+	if r.lastCPUValues == nil || time.Since(r.lastCPUTime2) < 1*time.Second {
+		r.lastCPUValues = currentValues
+		r.lastCPUTime2 = now
+		return 0.0 // 第一次读取无法计算差值
+	}
+	
+	// 计算各项差值
+	userDiff := currentValues[0] - r.lastCPUValues[0]     // user
+	niceDiff := currentValues[1] - r.lastCPUValues[1]     // nice
+	systemDiff := currentValues[2] - r.lastCPUValues[2]   // system
+	idleDiff := currentValues[3] - r.lastCPUValues[3]     // idle
+	iowaitDiff := currentValues[4] - r.lastCPUValues[4]   // iowait
+	irqDiff := currentValues[5] - r.lastCPUValues[5]      // irq
+	softirqDiff := currentValues[6] - r.lastCPUValues[6]  // softirq
+	stealDiff := 0.0
+	if len(currentValues) > 7 {
+		stealDiff = currentValues[7] - r.lastCPUValues[7]  // steal
 	}
 	
 	// 计算CPU使用率
-	// total = 所有时间
-	// used = 非空闲时间（排除idle和iowait）
-	total := user + nice + system + idle + iowait + irq + softirq + steal
-	if total == 0 {
+	// total = 所有时间差值
+	// used = 非空闲时间差值（排除idle和iowait）
+	totalDiff := userDiff + niceDiff + systemDiff + idleDiff + iowaitDiff + irqDiff + softirqDiff + stealDiff
+	if totalDiff <= 0 {
 		return 0.0
 	}
 	
-	used := user + nice + system + irq + softirq + steal // 实际CPU使用时间
-	cpuUsage := (used / total) * 100.0
+	usedDiff := userDiff + niceDiff + systemDiff + irqDiff + softirqDiff + stealDiff // 实际CPU使用时间差值
+	cpuUsage := (usedDiff / totalDiff) * 100.0
+	
+	// 更新保存的值
+	r.lastCPUValues = currentValues
+	r.lastCPUTime2 = now
 	
 	return cpuUsage
 }
