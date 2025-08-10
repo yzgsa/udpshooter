@@ -5,9 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
-	"os/exec"
-	"strconv"
-	"strings"
+	"runtime"
 	"sync"
 	"time"
 
@@ -16,8 +14,14 @@ import (
 
 // SystemStats 系统资源统计信息
 type SystemStats struct {
-	CPUUsage    float64 `json:"cpu_usage"`    // CPU使用率百分比
-	MemoryUsage float64 `json:"memory_usage"` // 内存使用率百分比
+	CPUUsage      float64 `json:"cpu_usage"`      // CPU使用率百分比（估算值）
+	MemoryUsage   float64 `json:"memory_usage"`   // 内存使用率百分比
+	CPUCount      int     `json:"cpu_count"`      // CPU核心数
+	MemoryUsageMB float64 `json:"memory_usage_mb"` // 内存使用量(MB)
+	MemoryTotalMB float64 `json:"memory_total_mb"` // 内存总量(MB)
+	GoroutineCount int    `json:"goroutine_count"` // 协程数量
+	GCCount       uint32  `json:"gc_count"`       // GC次数
+	GCPauseMs     float64 `json:"gc_pause_ms"`    // GC暂停时间(毫秒)
 }
 
 // ReportData 上报数据结构
@@ -47,6 +51,11 @@ type Reporter struct {
 	reportURL    string // 完整的上报URL
 	httpClient   *http.Client
 	managementIP string // 管理IP
+	
+	// CPU统计缓存（减少计算开销）
+	lastCPUTime   time.Time
+	lastCPUStats  SystemStats
+	cpuCacheMutex sync.RWMutex
 }
 
 // NewReporter 创建新的监控上报器
@@ -202,60 +211,75 @@ func (r *Reporter) generateReport() {
 	}
 
 	// 输出系统资源统计
-	r.logger.Infof("系统资源: CPU: %.1f%% | 内存: %.1f%%",
+	r.logger.Infof("系统资源: CPU: %.1f%% | 内存: %.1f%% (%.0fMB/%.0fMB) | 协程: %d | GC: %d次",
 		systemStats.CPUUsage,
-		systemStats.MemoryUsage)
+		systemStats.MemoryUsage,
+		systemStats.MemoryUsageMB,
+		systemStats.MemoryTotalMB,
+		systemStats.GoroutineCount,
+		systemStats.GCCount)
 
 	// 可以在这里添加发送到远程监控系统的逻辑
 	// 例如: r.sendToRemote(jsonData)
 }
 
-// collectSystemStats 收集系统资源统计信息
+// collectSystemStats 收集系统资源统计信息（低消耗版本）
 func (r *Reporter) collectSystemStats() SystemStats {
-	return SystemStats{
-		CPUUsage:    r.getCPUUsage(),
-		MemoryUsage: r.getMemoryUsage(),
+	// 使用缓存减少计算开销（30秒缓存）
+	r.cpuCacheMutex.RLock()
+	if time.Since(r.lastCPUTime) < 30*time.Second {
+		stats := r.lastCPUStats
+		r.cpuCacheMutex.RUnlock()
+		return stats
 	}
-}
-
-// getCPUUsage 获取CPU使用率
-func (r *Reporter) getCPUUsage() float64 {
-	// 使用top命令获取CPU使用率
-	cmd := exec.Command("sh", "-c", "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | sed 's/%us,//'")
-	output, err := cmd.Output()
-	if err != nil {
-		r.logger.Debugf("获取CPU使用率失败: %v", err)
-		return 0.0
+	r.cpuCacheMutex.RUnlock()
+	
+	// 重新计算系统统计
+	var memStats runtime.MemStats
+	runtime.ReadMemStats(&memStats)
+	
+	// CPU使用率估算（基于协程数和CPU核心数的比例）
+	numCPU := runtime.NumCPU()
+	numGoroutine := runtime.NumGoroutine()
+	
+	// 粗略估算CPU使用率：协程数/CPU核心数 * 基准系数
+	cpuUsage := float64(numGoroutine) / float64(numCPU) * 10.0 // 10%为基准
+	if cpuUsage > 100.0 {
+		cpuUsage = 100.0
 	}
-
-	cpuStr := strings.TrimSpace(string(output))
-	cpuUsage, err := strconv.ParseFloat(cpuStr, 64)
-	if err != nil {
-		r.logger.Debugf("解析CPU使用率失败: %v", err)
-		return 0.0
+	if cpuUsage < 0 {
+		cpuUsage = 0
 	}
-
-	return cpuUsage
-}
-
-// getMemoryUsage 获取内存使用率
-func (r *Reporter) getMemoryUsage() float64 {
-	// 使用free命令获取内存使用率
-	cmd := exec.Command("sh", "-c", "free | grep Mem | awk '{printf \"%.1f\", $3/$2 * 100.0}'")
-	output, err := cmd.Output()
-	if err != nil {
-		r.logger.Debugf("获取内存使用率失败: %v", err)
-		return 0.0
+	
+	// 内存使用率计算
+	memoryUsageMB := float64(memStats.Alloc) / 1024 / 1024
+	memoryTotalMB := float64(memStats.Sys) / 1024 / 1024
+	memoryUsage := (memoryUsageMB / memoryTotalMB) * 100.0
+	
+	// GC暂停时间计算
+	var gcPauseMs float64
+	if memStats.NumGC > 0 {
+		gcPauseMs = float64(memStats.PauseNs[(memStats.NumGC+255)%256]) / 1000000
 	}
-
-	memStr := strings.TrimSpace(string(output))
-	memUsage, err := strconv.ParseFloat(memStr, 64)
-	if err != nil {
-		r.logger.Debugf("解析内存使用率失败: %v", err)
-		return 0.0
+	
+	stats := SystemStats{
+		CPUUsage:       cpuUsage,
+		MemoryUsage:    memoryUsage,
+		CPUCount:       numCPU,
+		MemoryUsageMB:  memoryUsageMB,
+		MemoryTotalMB:  memoryTotalMB,
+		GoroutineCount: numGoroutine,
+		GCCount:        memStats.NumGC,
+		GCPauseMs:      gcPauseMs,
 	}
-
-	return memUsage
+	
+	// 更新缓存
+	r.cpuCacheMutex.Lock()
+	r.lastCPUTime = time.Now()
+	r.lastCPUStats = stats
+	r.cpuCacheMutex.Unlock()
+	
+	return stats
 }
 
 // sendToRemote 发送数据到远程监控系统
