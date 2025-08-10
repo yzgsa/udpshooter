@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
-	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -80,12 +79,6 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger, managementI
 	// 创建HTTP客户端，设置超时时间
 	httpClient := &http.Client{
 		Timeout: 3 * time.Second, // 3秒超时，快速失败不阻塞打流
-		Transport: &http.Transport{
-			DialTimeout:         2 * time.Second,
-			TLSHandshakeTimeout: 2 * time.Second,
-			MaxIdleConns:        5,
-			IdleConnTimeout:     30 * time.Second,
-		},
 	}
 
 	return &Reporter{
