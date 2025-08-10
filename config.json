@@ -26,16 +26,8 @@
         "workers_per_ip": 10,
         "buffer_size": 131072
     },
-    "logging": {
-        "level": "info",
-        "file": "logs/udpshooter.log",
-        "max_size_mb": 100,
-        "max_backups": 7,
-        "max_age_days": 7,
-        "compress": true
-    },
     "report": {
-        "interval": 600,
+        "interval": 5,
         "url": "http://192.168.1.52:8000/udpshooter/monitor/"
     },
     "schedules": [
