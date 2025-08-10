@@ -5,7 +5,10 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -211,7 +214,7 @@ func (r *Reporter) generateReport() {
 	}
 
 	// 输出系统资源统计
-	r.logger.Infof("系统资源: CPU: %.1f%% | 内存: %.1f%% (%.0fMB/%.0fMB) | 协程: %d | GC: %d次",
+	r.logger.Infof("系统资源: CPU: %.1f%% | 内存: %.1f%% (%.0f/%.0fMB) | 协程: %d | GC: %d次",
 		systemStats.CPUUsage,
 		systemStats.MemoryUsage,
 		systemStats.MemoryUsageMB,
@@ -223,7 +226,7 @@ func (r *Reporter) generateReport() {
 	// 例如: r.sendToRemote(jsonData)
 }
 
-// collectSystemStats 收集系统资源统计信息（低消耗版本）
+// collectSystemStats 收集Linux系统整体资源统计信息
 func (r *Reporter) collectSystemStats() SystemStats {
 	// 使用缓存减少计算开销（30秒缓存）
 	r.cpuCacheMutex.RLock()
@@ -234,43 +237,25 @@ func (r *Reporter) collectSystemStats() SystemStats {
 	}
 	r.cpuCacheMutex.RUnlock()
 	
-	// 重新计算系统统计
+	// 获取系统整体CPU使用率
+	cpuUsage := r.getSystemCPUUsage()
+	
+	// 获取系统整体内存使用率
+	memUsage, memTotal, memUsed := r.getSystemMemoryUsage()
+	
+	// 获取Go进程相关信息
 	var memStats runtime.MemStats
 	runtime.ReadMemStats(&memStats)
 	
-	// CPU使用率估算（基于协程数和CPU核心数的比例）
-	numCPU := runtime.NumCPU()
-	numGoroutine := runtime.NumGoroutine()
-	
-	// 粗略估算CPU使用率：协程数/CPU核心数 * 基准系数
-	cpuUsage := float64(numGoroutine) / float64(numCPU) * 10.0 // 10%为基准
-	if cpuUsage > 100.0 {
-		cpuUsage = 100.0
-	}
-	if cpuUsage < 0 {
-		cpuUsage = 0
-	}
-	
-	// 内存使用率计算
-	memoryUsageMB := float64(memStats.Alloc) / 1024 / 1024
-	memoryTotalMB := float64(memStats.Sys) / 1024 / 1024
-	memoryUsage := (memoryUsageMB / memoryTotalMB) * 100.0
-	
-	// GC暂停时间计算
-	var gcPauseMs float64
-	if memStats.NumGC > 0 {
-		gcPauseMs = float64(memStats.PauseNs[(memStats.NumGC+255)%256]) / 1000000
-	}
-	
 	stats := SystemStats{
 		CPUUsage:       cpuUsage,
-		MemoryUsage:    memoryUsage,
-		CPUCount:       numCPU,
-		MemoryUsageMB:  memoryUsageMB,
-		MemoryTotalMB:  memoryTotalMB,
-		GoroutineCount: numGoroutine,
+		MemoryUsage:    memUsage,
+		CPUCount:       runtime.NumCPU(),
+		MemoryUsageMB:  memUsed,
+		MemoryTotalMB:  memTotal,
+		GoroutineCount: runtime.NumGoroutine(),
 		GCCount:        memStats.NumGC,
-		GCPauseMs:      gcPauseMs,
+		GCPauseMs:      float64(memStats.PauseNs[(memStats.NumGC+255)%256]) / 1000000,
 	}
 	
 	// 更新缓存
@@ -280,6 +265,104 @@ func (r *Reporter) collectSystemStats() SystemStats {
 	r.cpuCacheMutex.Unlock()
 	
 	return stats
+}
+
+// getSystemCPUUsage 获取Linux系统整体CPU使用率
+func (r *Reporter) getSystemCPUUsage() float64 {
+	// 读取/proc/stat获取CPU时间
+	data, err := os.ReadFile("/proc/stat")
+	if err != nil {
+		r.logger.Debugf("读取/proc/stat失败: %v", err)
+		return 0.0
+	}
+	
+	lines := strings.Split(string(data), "\n")
+	if len(lines) == 0 {
+		return 0.0
+	}
+	
+	// 解析第一行: cpu user nice system idle iowait irq softirq steal guest guest_nice
+	fields := strings.Fields(lines[0])
+	if len(fields) < 5 {
+		return 0.0
+	}
+	
+	user, _ := strconv.ParseFloat(fields[1], 64)
+	nice, _ := strconv.ParseFloat(fields[2], 64)
+	system, _ := strconv.ParseFloat(fields[3], 64)
+	idle, _ := strconv.ParseFloat(fields[4], 64)
+	iowait := 0.0
+	if len(fields) > 5 {
+		iowait, _ = strconv.ParseFloat(fields[5], 64)
+	}
+	
+	// 计算CPU使用率
+	total := user + nice + system + idle + iowait
+	if total == 0 {
+		return 0.0
+	}
+	
+	used := user + nice + system + iowait
+	cpuUsage := (used / total) * 100.0
+	
+	return cpuUsage
+}
+
+// getSystemMemoryUsage 获取Linux系统整体内存使用率
+func (r *Reporter) getSystemMemoryUsage() (usage float64, totalMB float64, usedMB float64) {
+	// 读取/proc/meminfo
+	data, err := os.ReadFile("/proc/meminfo")
+	if err != nil {
+		r.logger.Debugf("读取/proc/meminfo失败: %v", err)
+		return 0.0, 0.0, 0.0
+	}
+	
+	var memTotal, memFree, memAvailable, buffers, cached float64
+	
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		fields := strings.Fields(line)
+		if len(fields) < 3 {
+			continue
+		}
+		
+		value, err := strconv.ParseFloat(fields[1], 64)
+		if err != nil {
+			continue
+		}
+		
+		switch fields[0] {
+		case "MemTotal:":
+			memTotal = value
+		case "MemFree:":
+			memFree = value
+		case "MemAvailable:":
+			memAvailable = value
+		case "Buffers:":
+			buffers = value
+		case "Cached:":
+			cached = value
+		}
+	}
+	
+	if memTotal == 0 {
+		return 0.0, 0.0, 0.0
+	}
+	
+	// 计算内存使用率
+	// 如果有MemAvailable，使用它；否则用MemFree + Buffers + Cached
+	var memUsed float64
+	if memAvailable > 0 {
+		memUsed = memTotal - memAvailable
+	} else {
+		memUsed = memTotal - memFree - buffers - cached
+	}
+	
+	usage = (memUsed / memTotal) * 100.0
+	totalMB = memTotal / 1024.0  // KB转MB
+	usedMB = memUsed / 1024.0    // KB转MB
+	
+	return usage, totalMB, usedMB
 }
 
 // sendToRemote 发送数据到远程监控系统
