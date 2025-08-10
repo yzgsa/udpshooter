@@ -84,6 +84,16 @@ type UDPShooter struct {
 	networkOptimizer *NetworkOptimizer
 	scheduler        *Scheduler
 	reporter         *Reporter
+	statsChan        chan StatUpdate // 统计信息更新通道
+}
+
+// StatUpdate 统计更新信息结构体
+type StatUpdate struct {
+	SourceIP     string
+	BytesSent    int64
+	PacketsSent  int64
+	TargetAddrs  []*net.UDPAddr
+	PacketSize   int
 }
 
 // Stats 统计信息结构体
@@ -154,6 +164,7 @@ func NewUDPShooter(config *Config, logger *logrus.Logger) *UDPShooter {
 		startTime:        time.Now(),
 		packetPool:       NewOptimizedPacketPool(),
 		networkOptimizer: NewNetworkOptimizer(),
+		statsChan:        make(chan StatUpdate, 10000), // 缓冲大小10000，防止阻塞
 	}
 	
 	// 初始化调度器
@@ -309,31 +320,119 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 			// 批量发送到所有目标
 			batchWriter.WriteSingle(packet)
 
-			// 更新统计信息（原子操作）
+			// 更新统计信息（高性能原子操作）
 			// 实际发送的字节数 = 数据包大小 × 目标数量
 			actualBytesSent := int64(packetSize * len(connections))
 			u.stats.mu.Lock()
 			u.stats.bytesSent += actualBytesSent
 			u.stats.packetsSent++
-			
-			// 更新源IP统计
-			if sourceStats, exists := u.stats.sourceIPStats[sourceIP]; exists {
-				sourceStats.BytesSent += actualBytesSent
-				sourceStats.PacketsSent++
-				sourceStats.LastActive = time.Now()
-			}
-			
-			// 更新目标统计
-			for _, targetAddr := range targetAddrs {
-				targetKey := fmt.Sprintf("%s:%d", targetAddr.IP.String(), targetAddr.Port)
-				if targetStats, exists := u.stats.targetStats[targetKey]; exists {
-					targetStats.BytesSent += int64(packetSize)
-					targetStats.PacketsSent++
-				}
-			}
 			u.stats.mu.Unlock()
+			
+			// 批量更新详细统计（异步，减少热路径延迟）
+			select {
+			case u.statsChan <- StatUpdate{
+				SourceIP: sourceIP,
+				BytesSent: actualBytesSent,
+				PacketsSent: 1,
+				TargetAddrs: targetAddrs,
+				PacketSize: packetSize,
+			}:
+			default:
+				// 如果通道满了就跳过详细统计，不阻塞发送
+			}
 		}
 	}
+}
+
+// processStatsUpdates 异步处理统计信息更新
+func (u *UDPShooter) processStatsUpdates() {
+	defer u.wg.Done()
+	
+	// 批量处理缓冲
+	updateBuffer := make([]StatUpdate, 0, 1000)
+	ticker := time.NewTicker(100 * time.Millisecond) // 100ms批量更新一次
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-u.ctx.Done():
+			// 在退出前处理剩余的更新
+			u.processBatchUpdates(updateBuffer)
+			return
+			
+		case update := <-u.statsChan:
+			updateBuffer = append(updateBuffer, update)
+			// 如果缓冲满了就立即处理
+			if len(updateBuffer) >= 1000 {
+				u.processBatchUpdates(updateBuffer)
+				updateBuffer = updateBuffer[:0] // 重置缓冲
+			}
+			
+		case <-ticker.C:
+			// 定期处理缓冲中的更新
+			if len(updateBuffer) > 0 {
+				u.processBatchUpdates(updateBuffer)
+				updateBuffer = updateBuffer[:0] // 重置缓冲
+			}
+		}
+	}
+}
+
+// processBatchUpdates 批量处理统计更新
+func (u *UDPShooter) processBatchUpdates(updates []StatUpdate) {
+	if len(updates) == 0 {
+		return
+	}
+	
+	// 按源IP聚合统计
+	sourceStatsMap := make(map[string]*SourceStats)
+	targetStatsMap := make(map[string]*TargetStats)
+	
+	for _, update := range updates {
+		// 聚合源IP统计
+		if sourceStats, exists := sourceStatsMap[update.SourceIP]; exists {
+			sourceStats.BytesSent += update.BytesSent
+			sourceStats.PacketsSent += update.PacketsSent
+		} else {
+			sourceStatsMap[update.SourceIP] = &SourceStats{
+				BytesSent:   update.BytesSent,
+				PacketsSent: update.PacketsSent,
+				LastActive:  time.Now(), // 只在这里调用一次time.Now()
+			}
+		}
+		
+		// 聚合目标统计
+		for _, targetAddr := range update.TargetAddrs {
+			targetKey := fmt.Sprintf("%s:%d", targetAddr.IP.String(), targetAddr.Port)
+			if targetStats, exists := targetStatsMap[targetKey]; exists {
+				targetStats.BytesSent += int64(update.PacketSize)
+				targetStats.PacketsSent += update.PacketsSent
+			} else {
+				targetStatsMap[targetKey] = &TargetStats{
+					BytesSent:    int64(update.PacketSize) * update.PacketsSent,
+					PacketsSent: update.PacketsSent,
+				}
+			}
+		}
+	}
+	
+	// 一次性更新所有统计信息
+	u.stats.mu.Lock()
+	for sourceIP, stats := range sourceStatsMap {
+		if existingStats, exists := u.stats.sourceIPStats[sourceIP]; exists {
+			existingStats.BytesSent += stats.BytesSent
+			existingStats.PacketsSent += stats.PacketsSent
+			existingStats.LastActive = stats.LastActive
+		}
+	}
+	
+	for targetKey, stats := range targetStatsMap {
+		if existingStats, exists := u.stats.targetStats[targetKey]; exists {
+			existingStats.BytesSent += stats.BytesSent
+			existingStats.PacketsSent += stats.PacketsSent
+		}
+	}
+	u.stats.mu.Unlock()
 }
 
 // logStats 记录统计信息
@@ -428,6 +527,10 @@ func (u *UDPShooter) onScheduleCallback(start bool) {
 
 // startShooting 启动打流
 func (u *UDPShooter) startShooting() error {
+	// 启动异步统计更新处理协程
+	u.wg.Add(1)
+	go u.processStatsUpdates()
+	
 	// 分别解析IPv4和IPv6目标地址
 	var ipv4Targets []*net.UDPAddr
 	var ipv6Targets []*net.UDPAddr
