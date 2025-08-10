@@ -283,26 +283,33 @@ func (r *Reporter) getSystemCPUUsage() float64 {
 	
 	// 解析第一行: cpu user nice system idle iowait irq softirq steal guest guest_nice
 	fields := strings.Fields(lines[0])
-	if len(fields) < 5 {
+	if len(fields) < 8 { // 至少需要8个字段（包含softirq）
 		return 0.0
 	}
 	
-	user, _ := strconv.ParseFloat(fields[1], 64)
-	nice, _ := strconv.ParseFloat(fields[2], 64)
-	system, _ := strconv.ParseFloat(fields[3], 64)
-	idle, _ := strconv.ParseFloat(fields[4], 64)
-	iowait := 0.0
-	if len(fields) > 5 {
-		iowait, _ = strconv.ParseFloat(fields[5], 64)
+	user, _ := strconv.ParseFloat(fields[1], 64)     // 用户态时间
+	nice, _ := strconv.ParseFloat(fields[2], 64)     // 低优先级用户态时间
+	system, _ := strconv.ParseFloat(fields[3], 64)   // 内核态时间
+	idle, _ := strconv.ParseFloat(fields[4], 64)     // 空闲时间
+	iowait, _ := strconv.ParseFloat(fields[5], 64)   // IO等待时间（CPU空闲）
+	irq, _ := strconv.ParseFloat(fields[6], 64)      // 硬中断时间
+	softirq, _ := strconv.ParseFloat(fields[7], 64)  // 软中断时间（重要！）
+	
+	// 可选字段
+	steal := 0.0
+	if len(fields) > 8 {
+		steal, _ = strconv.ParseFloat(fields[8], 64)  // 虚拟化偷取时间
 	}
 	
 	// 计算CPU使用率
-	total := user + nice + system + idle + iowait
+	// total = 所有时间
+	// used = 非空闲时间（排除idle和iowait）
+	total := user + nice + system + idle + iowait + irq + softirq + steal
 	if total == 0 {
 		return 0.0
 	}
 	
-	used := user + nice + system + iowait
+	used := user + nice + system + irq + softirq + steal // 实际CPU使用时间
 	cpuUsage := (used / total) * 100.0
 	
 	return cpuUsage
