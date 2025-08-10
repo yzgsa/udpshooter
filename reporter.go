@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"os"
 	"runtime"
@@ -78,7 +79,13 @@ func NewReporter(config Report, stats *Stats, logger *logrus.Logger, managementI
 
 	// 创建HTTP客户端，设置超时时间
 	httpClient := &http.Client{
-		Timeout: 30 * time.Second,
+		Timeout: 3 * time.Second, // 3秒超时，快速失败不阻塞打流
+		Transport: &http.Transport{
+			DialTimeout:         2 * time.Second,
+			TLSHandshakeTimeout: 2 * time.Second,
+			MaxIdleConns:        5,
+			IdleConnTimeout:     30 * time.Second,
+		},
 	}
 
 	return &Reporter{
@@ -191,9 +198,9 @@ func (r *Reporter) generateReport() {
 		return
 	}
 
-	// 发送到远程监控系统
+	// 异步发送到远程监控系统（不阻塞主流程）
 	if r.reportURL != "" {
-		r.sendToRemote(jsonData)
+		go r.sendToRemoteAsync(jsonData) // 使用goroutine异步发送
 	}
 
 	// 输出监控报告
@@ -366,30 +373,36 @@ func (r *Reporter) getSystemMemoryUsage() (usage float64, totalMB float64, usedM
 }
 
 // sendToRemote 发送数据到远程监控系统
-func (r *Reporter) sendToRemote(data []byte) {
-	// 创建HTTP请求
-	req, err := http.NewRequestWithContext(r.ctx, "POST", r.reportURL, bytes.NewBuffer(data))
+// sendToRemoteAsync 异步发送数据到远程监控系统（不阻塞主线程）
+func (r *Reporter) sendToRemoteAsync(data []byte) {
+	// 设置超时时间，防止无限等待
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	
+	// 创建请求
+	req, err := http.NewRequestWithContext(ctx, "POST", r.reportURL, bytes.NewBuffer(data))
 	if err != nil {
-		r.logger.Errorf("创建HTTP请求失败: %v", err)
+		r.logger.Debugf("创建监控请求失败: %v", err)
 		return
 	}
-
+	
 	// 设置请求头
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("User-Agent", "UDP-Shooter/1.0")
-
-	// 发送请求
+	
+	// 发送请求（带超时）
 	resp, err := r.httpClient.Do(req)
 	if err != nil {
-		r.logger.Errorf("发送监控数据失败: %v", err)
+		// 只记录debug日志，不影响主功能
+		r.logger.Debugf("监控数据推送失败: %v", err)
 		return
 	}
 	defer resp.Body.Close()
-
+	
 	// 检查响应状态
 	if resp.StatusCode >= 200 && resp.StatusCode < 300 {
-		r.logger.Debugf("监控数据发送成功: %s (状态码: %d)", r.reportURL, resp.StatusCode)
+		r.logger.Debugf("监控数据推送成功: %s", r.reportURL)
 	} else {
-		r.logger.Warnf("监控数据发送异常: %s (状态码: %d)", r.reportURL, resp.StatusCode)
+		r.logger.Debugf("监控数据推送状态码: %d", resp.StatusCode)
 	}
 }
