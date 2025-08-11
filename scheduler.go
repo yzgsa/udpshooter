@@ -40,7 +40,7 @@ type Scheduler struct {
 	wg           sync.WaitGroup
 	mu           sync.RWMutex
 	activeCount  int
-	callback     func(bool) // 启动/停止回调函数
+	callback     func(bool, int64) // 启动/停止回调函数，增加带宽参数
 }
 
 // NewScheduler 创建新的时间调度器
@@ -85,8 +85,8 @@ func NewScheduler(schedules []Schedule, logger *logrus.Logger) *Scheduler {
 }
 
 // SetCallback 设置启动/停止回调函数
-// :param callback: 回调函数，参数为true表示启动，false表示停止
-func (s *Scheduler) SetCallback(callback func(bool)) {
+// :param callback: 回调函数，第一个参数为true表示启动，false表示停止；第二个参数为带宽限制
+func (s *Scheduler) SetCallback(callback func(bool, int64)) {
 	s.callback = callback
 }
 
@@ -125,7 +125,7 @@ func (s *Scheduler) scheduleLoop() {
 		case <-s.ctx.Done():
 			// 如果有活跃的任务，停止它们
 			if s.activeCount > 0 && s.callback != nil {
-				s.callback(false)
+				s.callback(false, 0)
 			}
 			return
 		case now := <-ticker.C:
@@ -221,12 +221,12 @@ func (s *Scheduler) startScheduleItem(item *ScheduleItem, now time.Time) {
 	item.RunCount++
 	s.activeCount++
 	
-	s.logger.Infof("🚀 启动调度任务 [%s]，第 %d 次运行", 
-		item.Schedule.ID, item.RunCount)
+	s.logger.Infof("🚀 启动调度任务 [%s]，第 %d 次运行，带宽限制: %d Mbps", 
+		item.Schedule.ID, item.RunCount, item.Schedule.BandwidthMbps)
 	
 	// 如果这是第一个活跃的任务，启动打流器
 	if s.activeCount == 1 && s.callback != nil {
-		s.callback(true)
+		s.callback(true, item.Schedule.BandwidthMbps)
 	}
 }
 
@@ -250,7 +250,7 @@ func (s *Scheduler) stopScheduleItem(item *ScheduleItem, now time.Time) {
 	
 	// 如果没有活跃的任务了，停止打流器
 	if s.activeCount == 0 && s.callback != nil {
-		s.callback(false)
+		s.callback(false, 0)
 	}
 	
 	// 重新排序

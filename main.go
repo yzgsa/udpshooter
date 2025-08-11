@@ -28,10 +28,12 @@ type Target struct {
 
 // Schedule 调度配置结构体
 type Schedule struct {
-	ID        string `json:"id"`
-	StartTime string `json:"start_time"` // 格式: "HH:MM:SS"
-	EndTime   string `json:"end_time"`   // 格式: "HH:MM:SS"
-	Repeat    string `json:"repeat"`     // "once", "daily", "weekdays"
+	ID           string `json:"id"`
+	StartTime    string `json:"start_time"`    // 格式: "HH:MM:SS"
+	EndTime      string `json:"end_time"`      // 格式: "HH:MM:SS"
+	Repeat       string `json:"repeat"`        // "once", "daily", "weekdays"
+	BandwidthMbps int64 `json:"bandwidth_mbps"` // 调度期间的带宽限制，单位 Mbps
+	Timezone     string `json:"timezone"`      // 时区，可选
 }
 
 // Report 上报配置结构体
@@ -85,6 +87,8 @@ type UDPShooter struct {
 	scheduler        *Scheduler
 	reporter         *Reporter
 	statsChan        chan StatUpdate // 统计信息更新通道
+	currentBandwidth int64           // 当前调度的带宽限制，单位 Mbps
+	bandwidthMu      sync.RWMutex    // 带宽配置读写锁
 }
 
 // StatUpdate 统计更新信息结构体
@@ -165,6 +169,7 @@ func NewUDPShooter(config *Config, logger *logrus.Logger) *UDPShooter {
 		packetPool:       NewOptimizedPacketPool(),
 		networkOptimizer: NewNetworkOptimizer(),
 		statsChan:        make(chan StatUpdate, 10000), // 缓冲大小10000，防止阻塞
+		currentBandwidth: config.Bandwidth.MaxBandwidthMbps, // 默认使用配置文件中的带宽
 	}
 	
 	// 初始化调度器
@@ -464,6 +469,21 @@ func (u *UDPShooter) logStats() {
 	}
 }
 
+// GetCurrentBandwidth 获取当前有效带宽限制
+func (u *UDPShooter) GetCurrentBandwidth() int64 {
+	u.bandwidthMu.RLock()
+	defer u.bandwidthMu.RUnlock()
+	return u.currentBandwidth
+}
+
+// SetCurrentBandwidth 设置当前有效带宽限制
+func (u *UDPShooter) SetCurrentBandwidth(bandwidth int64) {
+	u.bandwidthMu.Lock()
+	defer u.bandwidthMu.Unlock()
+	u.currentBandwidth = bandwidth
+	u.logger.Infof("🔧 带宽限制已更新为: %d Mbps", bandwidth)
+}
+
 // formatBytes 格式化字节数显示
 // :param bytes: 字节数
 // :return: 格式化后的字符串
@@ -513,9 +533,11 @@ func (u *UDPShooter) Start() error {
 }
 
 // onScheduleCallback 调度器回调函数
-func (u *UDPShooter) onScheduleCallback(start bool) {
+func (u *UDPShooter) onScheduleCallback(start bool, bandwidth int64) {
 	if start {
-		u.logger.Info("🚀 调度器启动打流...")
+		u.logger.Infof("🚀 调度器启动打流... (带宽限制: %d Mbps)", bandwidth)
+		// 设置当前带宽限制
+		u.SetCurrentBandwidth(bandwidth)
 		if err := u.startShooting(); err != nil {
 			u.logger.Errorf("调度启动打流失败: %v", err)
 		}
@@ -630,10 +652,11 @@ func (u *UDPShooter) stopShooting() {
 // :param targetAddrs: IPv4目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 修复：每个源IP应该分配 总带宽 / 源IP数量
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
-		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
+	// 使用当前有效的带宽限制
+	currentBandwidth := u.GetCurrentBandwidth()
+	bandwidthPerIP := currentBandwidth / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 当前带宽: %d Mbps | 每个源IP带宽: %d Mbps",
+		len(targetAddrs), len(sourceIPs), currentBandwidth, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
 		// 创建速率限制器，限制该IP的总流量
@@ -655,10 +678,11 @@ func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDP
 // :param targetAddrs: IPv6目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 修复：每个源IP应该分配 总带宽 / 源IP数量
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
-		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
+	// 使用当前有效的带宽限制
+	currentBandwidth := u.GetCurrentBandwidth()
+	bandwidthPerIP := currentBandwidth / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 当前带宽: %d Mbps | 每个源IP带宽: %d Mbps",
+		len(targetAddrs), len(sourceIPs), currentBandwidth, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
 		// 创建速率限制器，限制该IP的总流量
