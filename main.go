@@ -26,15 +26,33 @@ type Target struct {
 	Port int    `json:"port"`
 }
 
+// Schedule 调度配置结构体
+type Schedule struct {
+	ID           string `json:"id"`
+	StartTime    string `json:"start_time"`    // 格式: "HH:MM:SS"
+	EndTime      string `json:"end_time"`      // 格式: "HH:MM:SS"
+	Repeat       string `json:"repeat"`        // "once", "daily", "weekdays"
+	BandwidthMbps int64 `json:"bandwidth_mbps"` // 调度期间的带宽限制，单位 Mbps
+	Timezone     string `json:"timezone"`      // 时区，可选
+}
+
+// Report 上报配置结构体
+type Report struct {
+	Interval int    `json:"interval"` // 上报间隔，单位秒，默认600秒(10分钟)
+	URL      string `json:"url"`      // 完整的上报URL，例如: "http://localhost:8080/api/udpshooter/monitor/"
+}
+
 // Config 配置结构体
 type Config struct {
-	Targets   []Target `json:"targets"`
-	Bandwidth struct {
+	ConfigMode   string     `json:"config_mode,omitempty"` // "local" 或 "remote"
+	ManagementIP string     `json:"management_ip"`         // 本地管理IP，作为本机标识
+	Targets      []Target   `json:"targets"`
+	Bandwidth    struct {
 		MaxBandwidthMbps int64 `json:"max_bandwidth_mbps"`
 		MaxBytes         int64 `json:"max_bytes"`
 	} `json:"bandwidth"`
-	SourceIPs []string `json:"source_ips"`
-	Packet    struct {
+	SourceIPs   []string   `json:"source_ips"`
+	Packet      struct {
 		Size           int    `json:"size"`
 		PayloadPattern string `json:"payload_pattern"`
 	} `json:"packet"`
@@ -42,7 +60,7 @@ type Config struct {
 		WorkersPerIP int `json:"workers_per_ip"`
 		BufferSize   int `json:"buffer_size"`
 	} `json:"concurrency"`
-	Logging struct {
+	Logging     struct {
 		Level      string `json:"level"`
 		File       string `json:"file"`
 		MaxSizeMB  int    `json:"max_size_mb"`
@@ -50,6 +68,8 @@ type Config struct {
 		MaxAgeDays int    `json:"max_age_days"`
 		Compress   bool   `json:"compress"`
 	} `json:"logging"`
+	Report    Report     `json:"report"`
+	Schedules []Schedule `json:"schedules"`
 }
 
 // UDPShooter UDP打流器结构体
@@ -64,16 +84,49 @@ type UDPShooter struct {
 	totalBytes       int64
 	packetPool       *OptimizedPacketPool
 	networkOptimizer *NetworkOptimizer
+	scheduler        *Scheduler
+	reporter         *Reporter
+	statsChan        chan StatUpdate // 统计信息更新通道
+	currentBandwidth int64           // 当前调度的带宽限制，单位 Mbps
+	bandwidthMu      sync.RWMutex    // 带宽配置读写锁
+}
+
+// StatUpdate 统计更新信息结构体
+type StatUpdate struct {
+	SourceIP     string
+	BytesSent    int64
+	PacketsSent  int64
+	TargetAddrs  []*net.UDPAddr
+	PacketSize   int
 }
 
 // Stats 统计信息结构体
 type Stats struct {
-	mu            sync.RWMutex
-	bytesSent     int64
-	packetsSent   int64
-	startTime     time.Time
-	lastLogTime   time.Time
-	bandwidthMbps float64
+	mu               sync.RWMutex
+	bytesSent        int64
+	packetsSent      int64
+	startTime        time.Time
+	lastLogTime      time.Time
+	bandwidthMbps    float64
+	sourceIPStats    map[string]*SourceStats // 每个源IP的统计信息
+	targetStats      map[string]*TargetStats // 每个目标的连接状态
+}
+
+// SourceStats 源IP统计信息
+type SourceStats struct {
+	BytesSent     int64   `json:"bytes_sent"`
+	PacketsSent   int64   `json:"packets_sent"`
+	BandwidthMbps float64 `json:"bandwidth_mbps"`
+	LastActive    time.Time `json:"last_active"`
+}
+
+// TargetStats 目标统计信息
+type TargetStats struct {
+	Connected    bool      `json:"connected"`
+	BytesSent    int64     `json:"bytes_sent"`
+	PacketsSent  int64     `json:"packets_sent"`
+	LastPingTime time.Time `json:"last_ping_time"`
+	ResponseTime float64   `json:"response_time"` // 毫秒
 }
 
 // NewUDPShooter 创建新的UDP打流器实例
@@ -82,16 +135,50 @@ type Stats struct {
 // :return: UDP打流器实例
 func NewUDPShooter(config *Config, logger *logrus.Logger) *UDPShooter {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &UDPShooter{
+	
+	// 初始化统计信息
+	stats := &Stats{
+		startTime:     time.Now(),
+		lastLogTime:   time.Now(),
+		sourceIPStats: make(map[string]*SourceStats),
+		targetStats:   make(map[string]*TargetStats),
+	}
+	
+	// 为每个源IP初始化统计信息
+	for _, sourceIP := range config.SourceIPs {
+		stats.sourceIPStats[sourceIP] = &SourceStats{
+			LastActive: time.Now(),
+		}
+	}
+	
+	// 为每个目标初始化统计信息
+	for _, target := range config.Targets {
+		targetKey := fmt.Sprintf("%s:%d", target.Host, target.Port)
+		stats.targetStats[targetKey] = &TargetStats{
+			Connected: false,
+		}
+	}
+	
+	shooter := &UDPShooter{
 		config:           config,
 		logger:           logger,
-		stats:            &Stats{startTime: time.Now(), lastLogTime: time.Now()},
+		stats:            stats,
 		ctx:              ctx,
 		cancel:           cancel,
 		startTime:        time.Now(),
 		packetPool:       NewOptimizedPacketPool(),
 		networkOptimizer: NewNetworkOptimizer(),
+		statsChan:        make(chan StatUpdate, 10000), // 缓冲大小10000，防止阻塞
+		currentBandwidth: config.Bandwidth.MaxBandwidthMbps, // 默认使用配置文件中的带宽
 	}
+	
+	// 初始化调度器
+	shooter.scheduler = NewScheduler(config.Schedules, logger)
+	
+	// 初始化上报器
+	shooter.reporter = NewReporter(config.Report, stats, logger, config.ManagementIP)
+	
+	return shooter
 }
 
 // loadConfig 加载配置文件
@@ -176,6 +263,14 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 		conn, err := net.DialUDP("udp", &net.UDPAddr{IP: net.ParseIP(sourceIP)}, targetAddr)
 		if err != nil {
 			u.logger.Errorf("创建UDP连接失败 [%s] -> %s: %v", sourceIP, targetAddr.String(), err)
+			
+			// 更新目标连接状态
+			targetKey := fmt.Sprintf("%s:%d", targetAddr.IP.String(), targetAddr.Port)
+			u.stats.mu.Lock()
+			if targetStats, exists := u.stats.targetStats[targetKey]; exists {
+				targetStats.Connected = false
+			}
+			u.stats.mu.Unlock()
 			continue
 		}
 
@@ -186,6 +281,15 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 
 		connections[i] = conn
 		defer conn.Close()
+		
+		// 更新目标连接状态
+		targetKey := fmt.Sprintf("%s:%d", targetAddr.IP.String(), targetAddr.Port)
+		u.stats.mu.Lock()
+		if targetStats, exists := u.stats.targetStats[targetKey]; exists {
+			targetStats.Connected = true
+			targetStats.LastPingTime = time.Now()
+		}
+		u.stats.mu.Unlock()
 	}
 
 	if len(connections) == 0 {
@@ -221,15 +325,119 @@ func (u *UDPShooter) sendPackets(sourceIP string, targetAddrs []*net.UDPAddr, pa
 			// 批量发送到所有目标
 			batchWriter.WriteSingle(packet)
 
-			// 更新统计信息（原子操作）
+			// 更新统计信息（高性能原子操作）
 			// 实际发送的字节数 = 数据包大小 × 目标数量
 			actualBytesSent := int64(packetSize * len(connections))
 			u.stats.mu.Lock()
 			u.stats.bytesSent += actualBytesSent
 			u.stats.packetsSent++
 			u.stats.mu.Unlock()
+			
+			// 批量更新详细统计（异步，减少热路径延迟）
+			select {
+			case u.statsChan <- StatUpdate{
+				SourceIP: sourceIP,
+				BytesSent: actualBytesSent,
+				PacketsSent: 1,
+				TargetAddrs: targetAddrs,
+				PacketSize: packetSize,
+			}:
+			default:
+				// 如果通道满了就跳过详细统计，不阻塞发送
+			}
 		}
 	}
+}
+
+// processStatsUpdates 异步处理统计信息更新
+func (u *UDPShooter) processStatsUpdates() {
+	defer u.wg.Done()
+	
+	// 批量处理缓冲
+	updateBuffer := make([]StatUpdate, 0, 1000)
+	ticker := time.NewTicker(100 * time.Millisecond) // 100ms批量更新一次
+	defer ticker.Stop()
+	
+	for {
+		select {
+		case <-u.ctx.Done():
+			// 在退出前处理剩余的更新
+			u.processBatchUpdates(updateBuffer)
+			return
+			
+		case update := <-u.statsChan:
+			updateBuffer = append(updateBuffer, update)
+			// 如果缓冲满了就立即处理
+			if len(updateBuffer) >= 1000 {
+				u.processBatchUpdates(updateBuffer)
+				updateBuffer = updateBuffer[:0] // 重置缓冲
+			}
+			
+		case <-ticker.C:
+			// 定期处理缓冲中的更新
+			if len(updateBuffer) > 0 {
+				u.processBatchUpdates(updateBuffer)
+				updateBuffer = updateBuffer[:0] // 重置缓冲
+			}
+		}
+	}
+}
+
+// processBatchUpdates 批量处理统计更新
+func (u *UDPShooter) processBatchUpdates(updates []StatUpdate) {
+	if len(updates) == 0 {
+		return
+	}
+	
+	// 按源IP聚合统计
+	sourceStatsMap := make(map[string]*SourceStats)
+	targetStatsMap := make(map[string]*TargetStats)
+	
+	for _, update := range updates {
+		// 聚合源IP统计
+		if sourceStats, exists := sourceStatsMap[update.SourceIP]; exists {
+			sourceStats.BytesSent += update.BytesSent
+			sourceStats.PacketsSent += update.PacketsSent
+		} else {
+			sourceStatsMap[update.SourceIP] = &SourceStats{
+				BytesSent:   update.BytesSent,
+				PacketsSent: update.PacketsSent,
+				LastActive:  time.Now(), // 只在这里调用一次time.Now()
+			}
+		}
+		
+		// 聚合目标统计
+		for _, targetAddr := range update.TargetAddrs {
+			targetKey := fmt.Sprintf("%s:%d", targetAddr.IP.String(), targetAddr.Port)
+			if targetStats, exists := targetStatsMap[targetKey]; exists {
+				targetStats.BytesSent += int64(update.PacketSize)
+				targetStats.PacketsSent += update.PacketsSent
+			} else {
+				targetStatsMap[targetKey] = &TargetStats{
+					BytesSent:    int64(update.PacketSize) * update.PacketsSent,
+					PacketsSent: update.PacketsSent,
+				}
+			}
+		}
+	}
+	
+	// 一次性更新所有统计信息
+	u.stats.mu.Lock()
+	for sourceIP, stats := range sourceStatsMap {
+		if existingStats, exists := u.stats.sourceIPStats[sourceIP]; exists {
+			existingStats.BytesSent += stats.BytesSent
+			existingStats.PacketsSent += stats.PacketsSent
+			existingStats.LastActive = stats.LastActive
+		}
+	}
+	
+	for targetKey, stats := range targetStatsMap {
+		if existingStats, exists := u.stats.targetStats[targetKey]; exists {
+			existingStats.BytesSent += stats.BytesSent
+			existingStats.PacketsSent += stats.PacketsSent
+		}
+	}
+	u.stats.mu.Unlock()
 }
 
 // logStats 记录统计信息
@@ -259,6 +467,21 @@ func (u *UDPShooter) logStats() {
 			u.stats.mu.Unlock()
 		}
 	}
+}
+
+// GetCurrentBandwidth 获取当前有效带宽限制
+func (u *UDPShooter) GetCurrentBandwidth() int64 {
+	u.bandwidthMu.RLock()
+	defer u.bandwidthMu.RUnlock()
+	return u.currentBandwidth
+}
+
+// SetCurrentBandwidth 设置当前有效带宽限制
+func (u *UDPShooter) SetCurrentBandwidth(bandwidth int64) {
+	u.bandwidthMu.Lock()
+	defer u.bandwidthMu.Unlock()
+	u.currentBandwidth = bandwidth
+	u.logger.Infof("🔧 带宽限制已更新为: %d Mbps", bandwidth)
 }
 
 // formatBytes 格式化字节数显示
@@ -292,6 +515,44 @@ func formatNumber(num int64) string {
 
 // Start 启动UDP打流器
 func (u *UDPShooter) Start() error {
+	// 启动调度器
+	if u.scheduler != nil {
+		// 设置调度器回调函数
+		u.scheduler.SetCallback(u.onScheduleCallback)
+		u.scheduler.Start()
+		
+		// 如果有调度任务，等待调度器启动打流
+		if len(u.config.Schedules) > 0 {
+			u.logger.Info("⏰ 等待调度任务启动...")
+			return nil
+		}
+	}
+	
+	// 没有调度任务，直接启动打流
+	return u.startShooting()
+}
+
+// onScheduleCallback 调度器回调函数
+func (u *UDPShooter) onScheduleCallback(start bool, bandwidth int64) {
+	if start {
+		u.logger.Infof("🚀 调度器启动打流... (带宽限制: %d Mbps)", bandwidth)
+		// 设置当前带宽限制
+		u.SetCurrentBandwidth(bandwidth)
+		if err := u.startShooting(); err != nil {
+			u.logger.Errorf("调度启动打流失败: %v", err)
+		}
+	} else {
+		u.logger.Info("⏹️ 调度器停止打流...")
+		u.stopShooting()
+	}
+}
+
+// startShooting 启动打流
+func (u *UDPShooter) startShooting() error {
+	// 启动异步统计更新处理协程
+	u.wg.Add(1)
+	go u.processStatsUpdates()
+	
 	// 分别解析IPv4和IPv6目标地址
 	var ipv4Targets []*net.UDPAddr
 	var ipv6Targets []*net.UDPAddr
@@ -342,6 +603,11 @@ func (u *UDPShooter) Start() error {
 	// 启动统计日志协程
 	u.wg.Add(1)
 	go u.logStats()
+	
+	// 启动监控上报器
+	if u.reporter != nil {
+		u.reporter.Start()
+	}
 
 	// 启动IPv4打流
 	if len(ipv4Targets) > 0 && len(ipv4SourceIPs) > 0 {
@@ -370,15 +636,27 @@ func (u *UDPShooter) Start() error {
 	return nil
 }
 
+// stopShooting 停止打流
+func (u *UDPShooter) stopShooting() {
+	u.logger.Info("⏹️ 停止UDP打流...")
+	u.cancel()
+	
+	// 停止监控上报器
+	if u.reporter != nil {
+		u.reporter.Stop()
+	}
+}
+
 // startIPv4Shooter 启动IPv4打流器
 // :param sourceIPs: IPv4源IP列表
 // :param targetAddrs: IPv4目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 修复：每个源IP应该分配 总带宽 / 源IP数量
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
-		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
+	// 使用当前有效的带宽限制
+	currentBandwidth := u.GetCurrentBandwidth()
+	bandwidthPerIP := currentBandwidth / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv4配置 | 目标: %d个 | 源IP: %d个 | 当前带宽: %d Mbps | 每个源IP带宽: %d Mbps",
+		len(targetAddrs), len(sourceIPs), currentBandwidth, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
 		// 创建速率限制器，限制该IP的总流量
@@ -400,10 +678,11 @@ func (u *UDPShooter) startIPv4Shooter(sourceIPs []string, targetAddrs []*net.UDP
 // :param targetAddrs: IPv6目标地址列表
 // :param packetTemplate: 数据包模板
 func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDPAddr, packetTemplate []byte) {
-	// 修复：每个源IP应该分配 总带宽 / 源IP数量
-	bandwidthPerIP := u.config.Bandwidth.MaxBandwidthMbps / int64(len(sourceIPs))
-	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 总带宽: %d Mbps | 每个源IP带宽: %d Mbps",
-		len(targetAddrs), len(sourceIPs), u.config.Bandwidth.MaxBandwidthMbps, bandwidthPerIP)
+	// 使用当前有效的带宽限制
+	currentBandwidth := u.GetCurrentBandwidth()
+	bandwidthPerIP := currentBandwidth / int64(len(sourceIPs))
+	u.logger.Infof("🌐 IPv6配置 | 目标: %d个 | 源IP: %d个 | 当前带宽: %d Mbps | 每个源IP带宽: %d Mbps",
+		len(targetAddrs), len(sourceIPs), currentBandwidth, bandwidthPerIP)
 
 	for _, sourceIP := range sourceIPs {
 		// 创建速率限制器，限制该IP的总流量
@@ -423,6 +702,17 @@ func (u *UDPShooter) startIPv6Shooter(sourceIPs []string, targetAddrs []*net.UDP
 // Stop 停止UDP打流器
 func (u *UDPShooter) Stop() {
 	u.logger.Info("正在强制停止UDP打流器...")
+	
+	// 停止调度器
+	if u.scheduler != nil {
+		u.scheduler.Stop()
+	}
+	
+	// 停止监控上报器
+	if u.reporter != nil {
+		u.reporter.Stop()
+	}
+	
 	u.cancel()
 
 	// 输出最终统计信息
