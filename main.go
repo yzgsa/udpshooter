@@ -515,6 +515,11 @@ func formatNumber(num int64) string {
 
 // Start 启动UDP打流器
 func (u *UDPShooter) Start() error {
+	// 启动监控上报器（独立于调度和打流）
+	if u.reporter != nil {
+		u.reporter.Start()
+	}
+	
 	// 启动调度器
 	if u.scheduler != nil {
 		// 设置调度器回调函数
@@ -603,11 +608,6 @@ func (u *UDPShooter) startShooting() error {
 	// 启动统计日志协程
 	u.wg.Add(1)
 	go u.logStats()
-	
-	// 启动监控上报器
-	if u.reporter != nil {
-		u.reporter.Start()
-	}
 
 	// 启动IPv4打流
 	if len(ipv4Targets) > 0 && len(ipv4SourceIPs) > 0 {
@@ -640,11 +640,6 @@ func (u *UDPShooter) startShooting() error {
 func (u *UDPShooter) stopShooting() {
 	u.logger.Info("⏹️ 停止UDP打流...")
 	u.cancel()
-	
-	// 停止监控上报器
-	if u.reporter != nil {
-		u.reporter.Stop()
-	}
 }
 
 // startIPv4Shooter 启动IPv4打流器

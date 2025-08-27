@@ -22,8 +22,8 @@ type BannerInfo struct {
 // NewBannerInfo 创建banner信息
 func NewBannerInfo() *BannerInfo {
 	return &BannerInfo{
-		Version:    "v0.9.0",
-		BuildDate:  "2025-08-12",
+		Version:    "v0.9.1",
+		BuildDate:  "2025-08-17",
 		Author:     "yuanzi",
 		GoVersion:  runtime.Version(),
 		OS:         runtime.GOOS,
